@@ -1,0 +1,35 @@
+{
+  "entities": {
+    "UserTemplates": {
+      "title": "UserTemplates",
+      "description": "User template sets and active selection synchronized across devices",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The Firebase Auth UID of the owner"
+        },
+        "templateSets": {
+          "type": "array",
+          "description": "Array of task template sets for the user"
+        },
+        "activeTemplateSetId": {
+          "type": "string",
+          "description": "The ID of the currently selected template set"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp of last update"
+        }
+      },
+      "required": ["userId", "templateSets", "activeTemplateSetId"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/settings/{settingId}": {
+      "schema": "UserTemplates",
+      "description": "User synchronized settings including task templates"
+    }
+  }
+}

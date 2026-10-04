@@ -1,0 +1,63 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Default-deny catch-all safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Validation for UserTemplates document
+    function isValidUserTemplates(data, userId) {
+      return data.keys().hasAll(['userId', 'templateSets', 'activeTemplateSetId']) &&
+             data.keys().hasOnly(['userId', 'templateSets', 'activeTemplateSetId', 'updatedAt']) &&
+             data.userId == userId &&
+             data.userId == request.auth.uid &&
+             data.activeTemplateSetId is string &&
+             data.activeTemplateSetId.size() <= 128 &&
+             data.templateSets is list &&
+             data.templateSets.size() <= 50 &&
+             (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    // Test connection check document
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // Synchronized user settings and templates
+    match /users/{userId}/settings/{settingId} {
+      allow get: if isOwner(userId) && isValidId(settingId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) &&
+                       isValidId(settingId) &&
+                       isValidUserTemplates(incoming(), userId);
+      allow update: if isOwner(userId) &&
+                       isValidId(settingId) &&
+                       isValidUserTemplates(incoming(), userId) &&
+                       incoming().userId == existing().userId;
+      allow delete: if isOwner(userId) && isValidId(settingId);
+    }
+  }
+}

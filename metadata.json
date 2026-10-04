@@ -1,0 +1,8 @@
+{
+  "name": "Zadania",
+  "description": "Inteligentne planowanie i organizacja zadań oraz wydarzeń w kalendarzu, szablony zadań i synchronizacja z Google Tasks i Google Calendar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
