@@ -4,7 +4,6 @@ import {
   getDoc,
   setDoc,
   onSnapshot,
-  getDocFromServer,
   Unsubscribe,
 } from 'firebase/firestore';
 import { app, auth } from './firebaseAuth';
@@ -43,9 +42,10 @@ export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
   path: string | null
-): never {
+): void {
+  const errMsg = error instanceof Error ? error.message : String(error);
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: errMsg,
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
@@ -61,31 +61,28 @@ export function handleFirestoreError(
     operationType,
     path,
   };
-  console.error('Firestore Error:', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  // Log as warning rather than uncaught error to allow seamless offline operation
+  console.warn('Firestore Operation Info:', JSON.stringify(errInfo));
 }
 
 /**
- * Validates initial connection to Firestore as required by the Firebase skill.
+ * Validates initial connection to Firestore. Non-blocking with short timeout.
  */
 export async function testFirestoreConnection(): Promise<boolean> {
-  const testPath = 'test/connection';
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-    return true;
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.warn('Firestore: Klient jest w trybie offline. Sprawdź konfigurację sieciową.');
-    } else {
-      // Permission or non-existent doc on test path is normal
-      console.log('Firestore connection verified.');
-    }
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), 2000)
+    );
+    const snap = await Promise.race([
+      getDoc(doc(db, 'test', 'connection')),
+      timeoutPromise,
+    ]);
+    return snap.exists();
+  } catch {
     return false;
   }
 }
-
-// Kick off test connection
-testFirestoreConnection().catch(() => {});
 
 export interface CloudTemplatesData {
   userId: string;
@@ -96,15 +93,23 @@ export interface CloudTemplatesData {
 
 /**
  * Loads user template sets from Firestore.
+ * Gracefully falls back to null if offline or unreachable within 2.5s.
  */
 export async function loadCloudTemplates(
   userId: string
 ): Promise<{ templateSets: TaskTemplateSet[]; activeTemplateSetId: string } | null> {
   if (!userId) return null;
-  const path = `users/${userId}/settings/templates`;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return null;
+  }
+
   try {
     const docRef = doc(db, 'users', userId, 'settings', 'templates');
-    const snap = await getDoc(docRef);
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Firestore timeout')), 2500)
+    );
+    const snap = await Promise.race([getDoc(docRef), timeoutPromise]);
+
     if (snap.exists()) {
       const data = snap.data() as CloudTemplatesData;
       if (Array.isArray(data.templateSets) && data.templateSets.length > 0) {
@@ -115,13 +120,15 @@ export async function loadCloudTemplates(
       }
     }
     return null;
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, path);
+  } catch (err: any) {
+    console.warn(`Firestore: Tryb offline / lokalne szablony (${err?.message || 'offline'}).`);
+    return null;
   }
 }
 
 /**
  * Saves user template sets to Firestore, syncing across devices.
+ * Non-fatal if offline.
  */
 export async function saveCloudTemplates(
   userId: string,
@@ -129,7 +136,8 @@ export async function saveCloudTemplates(
   activeTemplateSetId: string
 ): Promise<void> {
   if (!userId) return;
-  const path = `users/${userId}/settings/templates`;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+
   try {
     const docRef = doc(db, 'users', userId, 'settings', 'templates');
     const payload: CloudTemplatesData = {
@@ -138,9 +146,15 @@ export async function saveCloudTemplates(
       activeTemplateSetId: activeTemplateSetId || templateSets[0]?.id || 'set-universal',
       updatedAt: new Date().toISOString(),
     };
-    await setDoc(docRef, payload, { merge: true });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, path);
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Firestore save timeout')), 3000)
+    );
+    await Promise.race([
+      setDoc(docRef, payload, { merge: true }),
+      timeoutPromise,
+    ]);
+  } catch (err: any) {
+    console.warn(`Firestore: Nie udało się zsynchronizować szablonów w chmurze (${err?.message || 'offline'}). Zapisano lokalnie.`);
   }
 }
 
@@ -169,9 +183,8 @@ export function subscribeToCloudTemplates(
       }
     },
     (error) => {
-      console.warn('Błąd subskrypcji Firestore:', error);
+      console.warn('Subskrypcja Firestore (tryb offline lub oczekiwanie):', error.message);
       if (onError) onError(error);
-      handleFirestoreError(error, OperationType.GET, path);
     }
   );
 }

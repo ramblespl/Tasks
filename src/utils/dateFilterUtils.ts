@@ -162,6 +162,9 @@ export function extractLocalDateStr(isoOrDateStr?: string): string {
   if (/^\d{4}-\d{2}-\d{2}$/.test(isoOrDateStr)) {
     return isoOrDateStr;
   }
+  if (/^\d{4}-\d{2}-\d{2}T00:00:00(\.000)?Z$/i.test(isoOrDateStr)) {
+    return isoOrDateStr.split('T')[0];
+  }
   const d = new Date(isoOrDateStr);
   if (isNaN(d.getTime())) {
     return isoOrDateStr.substring(0, 10);

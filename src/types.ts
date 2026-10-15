@@ -35,6 +35,7 @@ export interface CalendarEventItem {
   colorId?: string;
   recurringEventId?: string;
   recurrence?: string[];
+  taskStatus?: 'needsAction' | 'completed';
 }
 
 export interface GoogleTaskList {

@@ -1,6 +1,8 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
+  setPersistence,
+  browserLocalPersistence,
   signInWithPopup,
   signInWithCredential,
   GoogleAuthProvider,
@@ -41,6 +43,15 @@ declare global {
 export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 export const auth = getAuth(app);
 
+// Enable local device persistence for Firebase Authentication
+try {
+  setPersistence(auth, browserLocalPersistence).catch((err) => {
+    console.warn('Ostrzeżenie dotyczące trwałości sesji Firebase Auth:', err);
+  });
+} catch {
+  // Ignore in case environment restricts
+}
+
 export const SCOPES = [
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/tasks',
@@ -53,39 +64,63 @@ export const STORAGE_KEY_TOKEN = 'travel_google_auth_token';
 export const STORAGE_KEY_EXPIRES_AT = 'travel_google_auth_expires_at';
 export const STORAGE_KEY_USER = 'travel_google_auth_user';
 export const STORAGE_KEY_CONSENT = 'travel_google_auth_consent_granted';
+export const STORAGE_KEY_REMEMBER_DEVICE = 'travel_google_auth_remember_device';
 
 const ALL_STORAGE_KEYS = [
   STORAGE_KEY_TOKEN,
   STORAGE_KEY_EXPIRES_AT,
   STORAGE_KEY_USER,
   STORAGE_KEY_CONSENT,
+  STORAGE_KEY_REMEMBER_DEVICE,
 ];
+
+export const isRememberDeviceEnabled = (): boolean => {
+  try {
+    const val = localStorage.getItem(STORAGE_KEY_REMEMBER_DEVICE);
+    return val === null ? true : val === 'true'; // Domyślnie włączone zapamiętywanie na urządzeniu
+  } catch {
+    return true;
+  }
+};
+
+export const setRememberDevice = (remember: boolean) => {
+  try {
+    localStorage.setItem(STORAGE_KEY_REMEMBER_DEVICE, String(remember));
+  } catch (err) {
+    console.warn('Błąd zapisu preferencji zapamiętywania urządzenia:', err);
+  }
+};
 
 export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds = 3600) => {
   try {
-    const expiresAt = Date.now() + Math.max(300, expiresInSeconds - 60) * 1000;
+    const expiresAt = Date.now() + Math.max(300, expiresInSeconds) * 1000;
+    // Always persist to localStorage so reopening the app or browser never asks to log in again
     localStorage.setItem(STORAGE_KEY_TOKEN, token);
     localStorage.setItem(STORAGE_KEY_EXPIRES_AT, String(expiresAt));
     localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
     localStorage.setItem(STORAGE_KEY_CONSENT, 'true');
+    localStorage.setItem(STORAGE_KEY_REMEMBER_DEVICE, 'true');
+
+    // Also mirror to sessionStorage
+    sessionStorage.setItem(STORAGE_KEY_TOKEN, token);
+    sessionStorage.setItem(STORAGE_KEY_EXPIRES_AT, String(expiresAt));
+    sessionStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
+    sessionStorage.setItem(STORAGE_KEY_CONSENT, 'true');
   } catch (err) {
-    console.warn('Nie udało się zapisać sesji w localStorage:', err);
+    console.warn('Nie udało się zapisać sesji w pamięci urządzenia:', err);
   }
 };
 
 export const getStoredAuth = (): { token: string; user: GoogleUser; isConsentGranted: boolean } | null => {
   try {
-    const consent = localStorage.getItem(STORAGE_KEY_CONSENT);
-    const token = localStorage.getItem(STORAGE_KEY_TOKEN);
-    const expiresAt = Number(localStorage.getItem(STORAGE_KEY_EXPIRES_AT) || 0);
-    const userJson = localStorage.getItem(STORAGE_KEY_USER);
+    const token =
+      localStorage.getItem(STORAGE_KEY_TOKEN) ||
+      sessionStorage.getItem(STORAGE_KEY_TOKEN);
+    const userJson =
+      localStorage.getItem(STORAGE_KEY_USER) ||
+      sessionStorage.getItem(STORAGE_KEY_USER);
 
-    if (consent !== 'true' || !token) return null;
-
-    // Check expiration
-    if (expiresAt && Date.now() > expiresAt) {
-      return null;
-    }
+    if (!token) return null;
 
     let user: GoogleUser = {
       uid: 'google-saved',
@@ -103,14 +138,17 @@ export const getStoredAuth = (): { token: string; user: GoogleUser; isConsentGra
 
     return { token, user, isConsentGranted: true };
   } catch (err) {
-    console.warn('Błąd odczytu sesji z localStorage:', err);
+    console.warn('Błąd odczytu sesji z pamięci urządzenia:', err);
     return null;
   }
 };
 
 export const hasConsentGranted = (): boolean => {
   try {
-    return localStorage.getItem(STORAGE_KEY_CONSENT) === 'true';
+    return (
+      localStorage.getItem(STORAGE_KEY_CONSENT) === 'true' ||
+      sessionStorage.getItem(STORAGE_KEY_CONSENT) === 'true'
+    );
   } catch {
     return false;
   }
@@ -120,6 +158,7 @@ export const clearStoredAuth = () => {
   try {
     for (const key of ALL_STORAGE_KEYS) {
       localStorage.removeItem(key);
+      sessionStorage.removeItem(key);
     }
   } catch (err) {
     console.warn('Błąd czyszczenia pamięci autoryzacji:', err);
@@ -184,32 +223,184 @@ const waitForGsi = (timeoutMs = 2500): Promise<boolean> => {
   });
 };
 
+let isRefreshingToken = false;
+let tokenRefreshPromise: Promise<string | null> | null = null;
+let lastSilentRefreshAttempt = 0;
+
+export const isStoredTokenExpired = (): boolean => {
+  try {
+    const expiresAt = Number(
+      localStorage.getItem(STORAGE_KEY_EXPIRES_AT) ||
+        sessionStorage.getItem(STORAGE_KEY_EXPIRES_AT) ||
+        0
+    );
+    // Token is considered expired if expiresAt is 0 or less than 2 minutes remaining
+    return expiresAt === 0 || Date.now() >= expiresAt - 120000;
+  } catch {
+    return true;
+  }
+};
+
+// Silent Google OAuth token refresh in background (without popup if previously authorized)
+export const refreshGoogleTokenSilently = async (): Promise<string | null> => {
+  if (isRefreshingToken && tokenRefreshPromise) {
+    return tokenRefreshPromise;
+  }
+
+  // Cooldown to avoid hammering GIS and triggering continuous focus/blur cycles
+  const now = Date.now();
+  if (now - lastSilentRefreshAttempt < 45000) {
+    return cachedAccessToken;
+  }
+  lastSilentRefreshAttempt = now;
+
+  const clientId =
+    (firebaseConfig as Record<string, any>).oAuthClientId ||
+    (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID;
+  if (!clientId) return null;
+
+  isRefreshingToken = true;
+  tokenRefreshPromise = (async () => {
+    try {
+      const isLoaded = await waitForGsi(2000);
+      if (!isLoaded || !window.google?.accounts?.oauth2) {
+        return null;
+      }
+
+      return await new Promise<string | null>((resolve) => {
+        let finished = false;
+        const timer = setTimeout(() => {
+          if (!finished) {
+            finished = true;
+            resolve(null);
+          }
+        }, 3500);
+
+        try {
+          const stored = getStoredAuth();
+          const tokenClient = window.google!.accounts.oauth2.initTokenClient({
+            client_id: clientId,
+            scope: SCOPES.join(' '),
+            callback: (response) => {
+              if (finished) return;
+              finished = true;
+              clearTimeout(timer);
+
+              if (response.access_token) {
+                const newToken = response.access_token;
+                cachedAccessToken = newToken;
+                const user = cachedUser || stored?.user || {
+                  uid: 'google-saved',
+                  displayName: 'Użytkownik Google',
+                  email: '',
+                  photoURL: null,
+                };
+                cachedUser = user;
+                saveStoredAuth(newToken, user, Number((response as any).expires_in) || 3600);
+                notifyListeners(user);
+                resolve(newToken);
+              } else {
+                resolve(null);
+              }
+            },
+            error_callback: () => {
+              if (finished) return;
+              finished = true;
+              clearTimeout(timer);
+              resolve(null);
+            },
+          });
+
+          // Silent token renewal with account hint if available
+          const reqConfig: { prompt: string; hint?: string } = { prompt: '' };
+          if (stored?.user?.email) {
+            reqConfig.hint = stored.user.email;
+          }
+          tokenClient.requestAccessToken(reqConfig);
+        } catch {
+          if (!finished) {
+            finished = true;
+            clearTimeout(timer);
+            resolve(null);
+          }
+        }
+      });
+    } finally {
+      isRefreshingToken = false;
+      tokenRefreshPromise = null;
+    }
+  })();
+
+  return tokenRefreshPromise;
+};
+
+// Returns cached token or silently refreshes if expired/near expiration
+export const getValidAccessToken = async (): Promise<string | null> => {
+  const stored = getStoredAuth();
+  if (!stored) return cachedAccessToken;
+
+  const expiresAt = Number(
+    localStorage.getItem(STORAGE_KEY_EXPIRES_AT) ||
+      sessionStorage.getItem(STORAGE_KEY_EXPIRES_AT) ||
+      0
+  );
+  if (expiresAt > 0 && Date.now() > expiresAt - 180000) {
+    const freshToken = await refreshGoogleTokenSilently();
+    if (freshToken) return freshToken;
+  }
+
+  return cachedAccessToken || stored.token;
+};
+
 export const initAuth = (
   onAuthSuccess?: (user: GoogleUser, token: string) => void,
   onAuthFailure?: () => void
 ) => {
-  // Check stored session in localStorage for automatic resume
+  // Check stored session in localStorage/sessionStorage for automatic resume
   const stored = getStoredAuth();
   if (stored && stored.token && stored.user) {
     cachedAccessToken = stored.token;
     cachedUser = stored.user;
     notifyListeners(stored.user);
-    if (onAuthSuccess) onAuthSuccess(stored.user, stored.token);
+    if (onAuthSuccess) {
+      onAuthSuccess(stored.user, stored.token);
+    }
+
+    // Always attempt silent background token refresh to ensure the token remains fresh
+    refreshGoogleTokenSilently()
+      .then((freshToken) => {
+        if (freshToken && onAuthSuccess) {
+          cachedAccessToken = freshToken;
+          cachedUser = stored.user;
+          saveStoredAuth(freshToken, stored.user);
+          notifyListeners(stored.user);
+          onAuthSuccess(stored.user, freshToken);
+        }
+      })
+      .catch((err) => {
+        console.warn('Ciche odświeżenie tokenu Google w tle (kontynuacja z istniejącą sesją):', err);
+      });
   }
 
   return onAuthStateChanged(auth, async (firebaseUser: User | null) => {
+    const existingToken =
+      cachedAccessToken ||
+      localStorage.getItem(STORAGE_KEY_TOKEN) ||
+      sessionStorage.getItem(STORAGE_KEY_TOKEN);
+
     if (firebaseUser) {
       const mapped = mapUser(firebaseUser);
-      if (cachedAccessToken && mapped) {
-        saveStoredAuth(cachedAccessToken, mapped);
+      if (existingToken && mapped) {
+        cachedAccessToken = existingToken;
+        saveStoredAuth(existingToken, mapped);
         notifyListeners(mapped);
-        if (onAuthSuccess) onAuthSuccess(mapped, cachedAccessToken);
+        if (onAuthSuccess) onAuthSuccess(mapped, existingToken);
       } else {
         notifyListeners(mapped);
-        if (onAuthFailure && !cachedAccessToken) onAuthFailure();
       }
     } else {
-      if (!cachedAccessToken) {
+      // If Firebase Auth is not signed in, but we have stored Google auth, keep user logged in!
+      if (!existingToken && (!stored || !stored.token)) {
         cachedUser = null;
         notifyListeners(null);
         if (onAuthFailure) onAuthFailure();

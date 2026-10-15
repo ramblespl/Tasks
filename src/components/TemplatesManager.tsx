@@ -112,14 +112,10 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
     return primaryCal ? primaryCal.id : 'primary';
   });
   const [specificDepartureDate, setSpecificDepartureDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 7);
-    return d.toISOString().split('T')[0];
+    return new Date().toISOString().split('T')[0];
   });
   const [specificReturnDate, setSpecificReturnDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 14);
-    return d.toISOString().split('T')[0];
+    return new Date().toISOString().split('T')[0];
   });
   const [addCalendarNotice, setAddCalendarNotice] = useState<string | null>(null);
   const [addCalendarError, setAddCalendarError] = useState<string | null>(null);
@@ -214,14 +210,10 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
 
   // Date preview for testing calculations
   const [previewStartDate, setPreviewStartDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 14);
-    return d.toISOString().split('T')[0];
+    return new Date().toISOString().split('T')[0];
   });
   const [previewEndDate, setPreviewEndDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 21);
-    return d.toISOString().split('T')[0];
+    return new Date().toISOString().split('T')[0];
   });
 
   // Text editor state
@@ -243,14 +235,10 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
   // "Generuj wydarzenia do kalendarza" modal state
   const [showGenerateEventsModal, setShowGenerateEventsModal] = useState(false);
   const [generateDepartureDate, setGenerateDepartureDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 7);
-    return d.toISOString().split('T')[0];
+    return new Date().toISOString().split('T')[0];
   });
   const [generateReturnDate, setGenerateReturnDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 14);
-    return d.toISOString().split('T')[0];
+    return new Date().toISOString().split('T')[0];
   });
   const [generateCalendarId, setGenerateCalendarId] = useState<string>(() => {
     if (selectedCalendar && selectedCalendar.id !== ALL_CALENDARS_ID) {
@@ -1353,8 +1341,14 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
 
       {/* Single Task Edit/Add Modal */}
       {showAddModal && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-5 sm:p-6 shadow-xl border border-neutral-200 max-h-[90vh] overflow-y-auto">
+        <div
+          className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4 overflow-y-auto"
+          onClick={() => setShowAddModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-lg w-full p-5 sm:p-6 shadow-xl border border-neutral-200 max-h-[90vh] overflow-y-auto my-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between pb-3 border-b border-neutral-100">
               <h3 className="text-base font-bold text-neutral-900">
                 {editingItem ? 'Edytuj zadanie w szablonie' : 'Nowe zadanie w szablonie'}
@@ -1774,8 +1768,14 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
 
       {/* Create New Template Set Modal */}
       {showNewSetModal && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl border border-neutral-200">
+        <div
+          className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+          onClick={() => setShowNewSetModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl border border-neutral-200"
+            onClick={(e) => e.stopPropagation()}
+          >
             <h3 className="text-base font-bold text-neutral-900 mb-2">Utwórz nowy szablon zadań</h3>
             <p className="text-xs text-neutral-500 mb-4">
               Stwórz nowy profil szablonu zadań (np. dla projektów, spotkań, rutyn codziennych lub wydarzeń).
@@ -1854,8 +1854,14 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
 
       {/* Edit Template Set Meta Modal */}
       {showEditSetModal && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl border border-neutral-200">
+        <div
+          className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+          onClick={() => setShowEditSetModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl border border-neutral-200"
+            onClick={(e) => e.stopPropagation()}
+          >
             <h3 className="text-base font-bold text-neutral-900 mb-2">Edytuj nazwę szablonu</h3>
             <form onSubmit={handleEditSetSubmit} className="space-y-4">
               <div>
@@ -1903,8 +1909,14 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
 
       {/* Modal: Generuj wydarzenia do kalendarza */}
       {showGenerateEventsModal && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-xs z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-3xl max-w-lg w-full p-6 sm:p-7 shadow-2xl border border-neutral-200 max-h-[90vh] overflow-y-auto animate-in fade-in zoom-in-95">
+        <div
+          className="fixed inset-0 bg-black/50 backdrop-blur-xs z-50 flex items-center justify-center p-4 overflow-y-auto"
+          onClick={() => setShowGenerateEventsModal(false)}
+        >
+          <div
+            className="bg-white rounded-3xl max-w-lg w-full p-6 sm:p-7 shadow-2xl border border-neutral-200 max-h-[90vh] overflow-y-auto animate-in fade-in zoom-in-95 my-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between pb-3.5 border-b border-neutral-100">
               <div className="flex items-center space-x-2.5">
                 <div className="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center shadow-xs">

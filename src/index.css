@@ -1,1 +1,83 @@
 @import "tailwindcss";
+
+/* 
+ * Kalendarz: Ukryty pasek przewijania (brak widocznego tła/ścieżki),
+ * pozostawiony jedynie bardzo wąski, subtelny znacznik (2px - 2.5px) informujący o możliwości przewijania.
+ */
+
+/* Komórki dni w widoku miesiąca i 4-tygodniowym */
+.day-cell-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.4) transparent;
+}
+
+.day-cell-scrollbar::-webkit-scrollbar {
+  width: 2px;
+  height: 2px;
+}
+
+.day-cell-scrollbar::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+
+.day-cell-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 9999px;
+  transition: background-color 0.15s ease;
+}
+
+.day-cell-scrollbar:hover::-webkit-scrollbar-thumb,
+.day-cell-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.7);
+}
+
+/* Osie czasu, harmonogram i sekcje przewijania w kalendarzu */
+.calendar-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.4) transparent;
+}
+
+.calendar-scrollbar::-webkit-scrollbar {
+  width: 2.5px;
+  height: 2.5px;
+}
+
+.calendar-scrollbar::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+
+.calendar-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 9999px;
+  transition: background-color 0.15s ease;
+}
+
+.calendar-scrollbar:hover::-webkit-scrollbar-thumb,
+.calendar-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.7);
+}
+
+/* Globalna reguła w całym kontenerze kalendarza */
+.calendar-root * {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+}
+
+.calendar-root *::-webkit-scrollbar {
+  width: 2.5px;
+  height: 2.5px;
+}
+
+.calendar-root *::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+
+.calendar-root *::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 9999px;
+}
+
+.calendar-root *::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.7);
+}
+

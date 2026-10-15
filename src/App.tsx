@@ -15,8 +15,22 @@ import {
   googleSignIn,
   logout,
   setManualAccessToken,
+  getStoredAuth,
+  refreshGoogleTokenSilently,
+  isStoredTokenExpired,
   auth,
 } from './services/firebaseAuth';
+import {
+  getCachedCalendars,
+  saveCachedCalendars,
+  getCachedEvents,
+  saveCachedEvents,
+  getCachedTaskLists,
+  saveCachedTaskLists,
+  getCachedTasks,
+  saveCachedTasks,
+  clearOfflineDataCache,
+} from './services/offlineDataCache';
 import {
   loadCloudTemplates,
   saveCloudTemplates,
@@ -34,6 +48,7 @@ import {
   deleteCalendarEvent,
   ALL_CALENDARS_ID,
   ALL_CALENDARS_ITEM,
+  formatCalendarEventStartEnd,
 } from './services/googleCalendarApi';
 import {
   listTaskLists,
@@ -80,28 +95,51 @@ import { LoginView } from './components/LoginView';
 import { CalendarCard } from './components/CalendarCard';
 import { TasksListCard } from './components/TasksListCard';
 import { TemplatesManager } from './components/TemplatesManager';
-import { AutoSyncStatus } from './components/AutoSyncStatus';
 import { FullCalendarView } from './components/FullCalendarView';
-import { Columns, Rows, Calendar as CalendarIcon, LayoutDashboard, Layers, ListTodo } from 'lucide-react';
+import { OfflineIndicator } from './components/PWAInstallBanner';
+import { MobileWidgetsModal } from './components/MobileWidgetsModal';
+import { WidgetEditModal } from './components/WidgetEditModal';
+import {
+  WidgetConfig,
+  WidgetId,
+  getWidgetConfig,
+  saveWidgetConfig,
+  resetWidgetConfig,
+  DEFAULT_WIDGET_CONFIGS,
+} from './services/widgetStorage';
+import { Columns, Rows, Calendar as CalendarIcon, LayoutDashboard, Layers, ListTodo, Sliders, X, Smartphone } from 'lucide-react';
 import {
   DateRangeState,
+  getDefaultDateRange,
   getCalendarViewDefaultDateRange,
   getDashboardCalendarDefaultDateRange,
   getDashboardTasksDefaultDateRange,
   getTasksViewTasksDefaultDateRange,
+  extractLocalDateStr,
+  getTodayDateString,
 } from './utils/dateFilterUtils';
+import { useUndo } from './context/UndoContext';
 
 export type DashboardLayoutMode = 'side-by-side' | 'stacked';
 
 export default function App() {
-  // Auth state
-  const [user, setUser] = useState<GoogleUser | null>(null);
-  const [token, setToken] = useState<string | null>(null);
+  const { pushAction } = useUndo();
+
+  // Auth state - initialized immediately from stored session so login is remembered across app opens
+  const [user, setUser] = useState<GoogleUser | null>(() => {
+    const stored = getStoredAuth();
+    return stored?.user || null;
+  });
+  const [token, setToken] = useState<string | null>(() => {
+    const stored = getStoredAuth();
+    return stored?.token || null;
+  });
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [isSessionExpired, setIsSessionExpired] = useState<boolean>(() => isStoredTokenExpired() && !!getStoredAuth()?.token);
 
-  // Calendars & Events state
-  const [calendars, setCalendars] = useState<CalendarListItem[]>([]);
+  // Calendars & Events state - initialized from offline cache for instant display
+  const [calendars, setCalendars] = useState<CalendarListItem[]>(() => getCachedCalendars());
   const [selectedCalendar, setSelectedCalendar] = useState<CalendarListItem | null>(null);
   const [selectedCalendarIds, setSelectedCalendarIds] = useState<string[]>(() => {
     try {
@@ -113,14 +151,14 @@ export default function App() {
     } catch (e) {}
     return [ALL_CALENDARS_ID];
   });
-  const [events, setEvents] = useState<CalendarEventItem[]>([]);
+  const [events, setEvents] = useState<CalendarEventItem[]>(() => getCachedEvents());
   const [isLoadingEvents, setIsLoadingEvents] = useState(false);
 
-  // Google Tasks state
-  const [taskLists, setTaskLists] = useState<GoogleTaskList[]>([]);
+  // Google Tasks state - initialized from offline cache for instant display
+  const [taskLists, setTaskLists] = useState<GoogleTaskList[]>(() => getCachedTaskLists());
   const [travelTaskList, setTravelTaskList] = useState<GoogleTaskList | null>(null);
   const [selectedTaskListIds, setSelectedTaskListIds] = useState<string[]>([ALL_TASK_LISTS_ID]);
-  const [tasks, setTasks] = useState<GoogleTaskItem[]>([]);
+  const [tasks, setTasks] = useState<GoogleTaskItem[]>(() => getCachedTasks());
   const [isLoadingTasks, setIsLoadingTasks] = useState(false);
 
   // Template Sets state
@@ -142,7 +180,7 @@ export default function App() {
     taskName?: string;
   } | null>(null);
 
-  // Hour in task title preference (default: false)
+  // Hour in task title preference (default: false - titles remain clean)
   const [includeTimeInTitle, setIncludeTimeInTitle] = useState<boolean>(() => {
     const saved = localStorage.getItem('travel_include_time_in_title');
     return saved !== null ? saved === 'true' : false;
@@ -152,6 +190,114 @@ export default function App() {
     setIncludeTimeInTitle(val);
     localStorage.setItem('travel_include_time_in_title', String(val));
   };
+
+  // Dashboard card controls states (hidden by default under "..." buttons)
+  const [dashboardCalendarControlsOpen, setDashboardCalendarControlsOpen] = useState(false);
+  const [dashboardTasksControlsOpen, setDashboardTasksControlsOpen] = useState(false);
+
+  // Mobile Widgets state
+  const [activeWidgetConfig, setActiveWidgetConfig] = useState<WidgetConfig | null>(null);
+  const [showWidgetsModal, setShowWidgetsModal] = useState(false);
+  const [editingWidgetInBar, setEditingWidgetInBar] = useState<WidgetConfig | null>(null);
+
+  const applyWidgetConfig = (config: WidgetConfig) => {
+    setActiveWidgetConfig(config);
+
+    // 1. Tab & view mode:
+    if (config.targetTab) {
+      setCurrentTab(config.targetTab);
+    }
+
+    // 2. Calendars visibility:
+    if (config.allCalendars) {
+      setSelectedCalendarIds([ALL_CALENDARS_ID]);
+    } else if (config.selectedCalendarIds.length > 0) {
+      setSelectedCalendarIds(config.selectedCalendarIds);
+    } else {
+      setSelectedCalendarIds([]);
+    }
+
+    // 3. Task lists visibility:
+    if (config.allTaskLists) {
+      setSelectedTaskListIds([ALL_TASK_LISTS_ID]);
+      setCalendarViewTaskListIds([ALL_TASK_LISTS_ID]);
+    } else if (config.selectedTaskListIds.length > 0) {
+      setSelectedTaskListIds(config.selectedTaskListIds);
+      setCalendarViewTaskListIds(config.selectedTaskListIds);
+    } else {
+      setSelectedTaskListIds([]);
+      setCalendarViewTaskListIds([]);
+    }
+
+    // 4. Date ranges / Due dates visibility:
+    if (config.dateRangeFilter === 'today') {
+      const todayStr = getTodayDateString();
+      const todayRange = {
+        mode: 'today' as const,
+        startDate: todayStr,
+        endDate: todayStr,
+        includeNoDate: config.includeNoDate,
+      };
+      setFullCalendarDateRange(todayRange);
+      setTasksViewTasksDateRange(todayRange);
+      setDashboardCalendarDateRange(todayRange);
+      setDashboardTasksDateRange(todayRange);
+    } else if (config.dateRangeFilter === 'next7days') {
+      const now = new Date();
+      const next7 = new Date();
+      next7.setDate(now.getDate() + 7);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const startStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+      const endStr = `${next7.getFullYear()}-${pad(next7.getMonth() + 1)}-${pad(next7.getDate())}`;
+      const range7 = {
+        mode: 'custom' as const,
+        startDate: startStr,
+        endDate: endStr,
+        includeNoDate: config.includeNoDate,
+      };
+      setFullCalendarDateRange(range7);
+      setTasksViewTasksDateRange(range7);
+      setDashboardCalendarDateRange(range7);
+      setDashboardTasksDateRange(range7);
+    } else if (config.dateRangeFilter === 'next30days') {
+      const now = new Date();
+      const next30 = new Date();
+      next30.setDate(now.getDate() + 30);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const startStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+      const endStr = `${next30.getFullYear()}-${pad(next30.getMonth() + 1)}-${pad(next30.getDate())}`;
+      const range30 = {
+        mode: 'custom' as const,
+        startDate: startStr,
+        endDate: endStr,
+        includeNoDate: config.includeNoDate,
+      };
+      setFullCalendarDateRange(range30);
+      setTasksViewTasksDateRange(range30);
+      setDashboardCalendarDateRange(range30);
+      setDashboardTasksDateRange(range30);
+    } else {
+      const defaultAll = getCalendarViewDefaultDateRange();
+      const rangeAll = {
+        ...defaultAll,
+        includeNoDate: config.dateRangeFilter !== 'hasDueOnly' && config.includeNoDate,
+      };
+      setFullCalendarDateRange(rangeAll);
+      setTasksViewTasksDateRange(rangeAll);
+      setDashboardCalendarDateRange(rangeAll);
+      setDashboardTasksDateRange(rangeAll);
+    }
+  };
+
+  // Check URL query parameter '?widget=' on load
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const widgetParam = params.get('widget') as WidgetId | null;
+    if (widgetParam && DEFAULT_WIDGET_CONFIGS[widgetParam]) {
+      const conf = getWidgetConfig(widgetParam);
+      applyWidgetConfig(conf);
+    }
+  }, []);
 
   // --- Cloud (Firestore) Templates Synchronization Across All Devices ---
   useEffect(() => {
@@ -236,6 +382,16 @@ export default function App() {
     return saved && ['dashboard', 'calendar', 'tasks', 'templates'].includes(saved) ? saved : 'dashboard';
   });
 
+  // Navigation history stack for mobile back navigation
+  const navHistoryRef = useRef<AppNavTab[]>([
+    (() => {
+      const saved = localStorage.getItem('travel_app_active_tab') as AppNavTab;
+      return saved && ['dashboard', 'calendar', 'tasks', 'templates'].includes(saved) ? saved : 'dashboard';
+    })(),
+  ]);
+  const lastBackPressTimeRef = useRef<number>(0);
+  const [showExitToast, setShowExitToast] = useState(false);
+
   // Mobile / compact side drawer overlay open state for Calendar and Tasks tabs
   const [isAppSidebarOpen, setIsAppSidebarOpen] = useState(false);
   const handleToggleAppSidebar = () => setIsAppSidebarOpen((prev) => !prev);
@@ -252,6 +408,107 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isAppSidebarOpen]);
 
+  // Mobile back action handler
+  const handleMobileBack = useCallback(() => {
+    // 1. Jeśli otwarty jest panel boczny, zamknij go
+    if (isAppSidebarOpen) {
+      setIsAppSidebarOpen(false);
+      return;
+    }
+
+    // 2. Jeśli otwarte jest jakiekolwiek okno modalne, zamknij je przez zdarzenie Escape
+    const openModals = document.querySelectorAll('[role="dialog"], .modal-overlay, #modal-create-event, #modal-new-task');
+    if (openModals.length > 0) {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+      return;
+    }
+
+    // 3. Jeśli mamy historię poprzednich widoków, cofnij do poprzedniego widoku
+    if (navHistoryRef.current.length > 1) {
+      navHistoryRef.current.pop(); // Usuń aktualny widok
+      const prevTab = navHistoryRef.current[navHistoryRef.current.length - 1];
+      setCurrentTab(prevTab);
+      localStorage.setItem('travel_app_active_tab', prevTab);
+      setIsAppSidebarOpen(false);
+      return;
+    }
+
+    // 4. Jeśli jesteśmy w innej sekcji niż pulpit, cofnij do pulpitu
+    if (currentTab !== 'dashboard') {
+      setCurrentTab('dashboard');
+      localStorage.setItem('travel_app_active_tab', 'dashboard');
+      navHistoryRef.current = ['dashboard'];
+      return;
+    }
+
+    // 5. Na ekranie głównym: podwójne naciśnięcie przycisku cofnij wychodzi z aplikacji
+    const now = Date.now();
+    if (now - lastBackPressTimeRef.current < 2000) {
+      setShowExitToast(true);
+      // Użytkownik nacisnął cofnij 2 razy w ciągu 2s -> pozwól na wyjście z aplikacji / historii
+      window.history.go(-1);
+    } else {
+      lastBackPressTimeRef.current = now;
+      setShowExitToast(true);
+      setTimeout(() => setShowExitToast(false), 2000);
+      window.history.pushState({ appTab: 'dashboard', root: true }, '');
+    }
+  }, [isAppSidebarOpen, currentTab]);
+
+  // Obsługa cofania w historii przeglądarki (przycisk wstecz / gest wstecz w systemie)
+  useEffect(() => {
+    try {
+      window.history.replaceState({ appTab: currentTab, root: true }, '');
+    } catch (e) {}
+
+    const handlePopState = () => {
+      handleMobileBack();
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [handleMobileBack, currentTab]);
+
+  // Obsługa gestu cofania od lewej krawędzi ekranu w widoku mobilnym
+  useEffect(() => {
+    let startX = 0;
+    let startY = 0;
+    let isFromEdge = false;
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) return;
+      const touch = e.touches[0];
+      // Gest od lewej krawędzi (do 35px od krawędzi)
+      if (touch.clientX <= 35) {
+        isFromEdge = true;
+        startX = touch.clientX;
+        startY = touch.clientY;
+      } else {
+        isFromEdge = false;
+      }
+    };
+
+    const handleTouchEnd = (e: TouchEvent) => {
+      if (!isFromEdge) return;
+      const touch = e.changedTouches[0];
+      const deltaX = touch.clientX - startX;
+      const deltaY = Math.abs(touch.clientY - startY);
+
+      // Przeciągnięcie w prawo o co najmniej 50px przy małym odchyleniu pionowym
+      if (deltaX > 50 && deltaY < 60) {
+        handleMobileBack();
+      }
+      isFromEdge = false;
+    };
+
+    window.addEventListener('touchstart', handleTouchStart, { passive: true });
+    window.addEventListener('touchend', handleTouchEnd, { passive: true });
+    return () => {
+      window.removeEventListener('touchstart', handleTouchStart);
+      window.removeEventListener('touchend', handleTouchEnd);
+    };
+  }, [handleMobileBack]);
+
   // View date range filters with user-specified defaults
   const [dashboardCalendarDateRange, setDashboardCalendarDateRange] = useState<DateRangeState>(
     () => getDashboardCalendarDefaultDateRange()
@@ -264,7 +521,10 @@ export default function App() {
     return saved !== null ? saved === 'true' : false;
   });
   const [fullCalendarDateRange, setFullCalendarDateRange] = useState<DateRangeState>(
-    () => getCalendarViewDefaultDateRange()
+    () => {
+      const savedMode = localStorage.getItem('travel_calendar_view_mode');
+      return savedMode === 'harmonogram' ? getDefaultDateRange() : getCalendarViewDefaultDateRange();
+    }
   );
   const [tasksViewTasksDateRange, setTasksViewTasksDateRange] = useState<DateRangeState>(
     () => getTasksViewTasksDefaultDateRange()
@@ -471,6 +731,8 @@ export default function App() {
   // Handle Logout
   const handleLogout = async () => {
     await logout();
+    clearOfflineDataCache();
+    setIsSessionExpired(false);
     setUser(null);
     setToken(null);
     initializedTokenRef.current = null;
@@ -500,6 +762,7 @@ export default function App() {
       if (res) {
         setUser(res.user);
         setToken(res.accessToken);
+        setIsSessionExpired(false);
         initializedTokenRef.current = res.accessToken;
         await initializeWorkspaceData(res.accessToken);
         addLog('Pomyślnie zaktualizowano uprawnienia Google i odświeżono dane', 'success');
@@ -508,6 +771,31 @@ export default function App() {
       console.error('Błąd ponownej autoryzacji:', err);
       setAuthError(err.message || 'Nie udało się zaktualizować uprawnień.');
       addLog(`Błąd ponownej autoryzacji: ${err.message}`, 'error');
+    } finally {
+      setIsSigningIn(false);
+    }
+  };
+
+  // One-click quick reauthorization when Google token expires
+  const handleQuickReauthorize = async () => {
+    try {
+      setIsSigningIn(true);
+      setAuthError(null);
+      setCalendarPermissionError(null);
+      setTasksPermissionError(null);
+      addLog('Odświeżanie sesji konta Google...', 'info');
+      const res = await googleSignIn({ prompt: 'select_account' });
+      if (res) {
+        setUser(res.user);
+        setToken(res.accessToken);
+        setIsSessionExpired(false);
+        initializedTokenRef.current = res.accessToken;
+        await initializeWorkspaceData(res.accessToken);
+        addLog(`Pomyślnie odświeżono połączenie z kontem Google (${res.user.displayName || res.user.email})`, 'success');
+      }
+    } catch (err: any) {
+      console.error('Błąd szybkiego odświeżenia sesji:', err);
+      setAuthError(err.message || 'Nie udało się odnowić sesji Google.');
     } finally {
       setIsSigningIn(false);
     }
@@ -527,11 +815,16 @@ export default function App() {
         const currentLists = listsPool && listsPool.length > 0 ? listsPool : taskListsRef.current;
         const items = await getAllTaskListsTasks(authToken, currentLists);
         setTasks(items);
+        saveCachedTasks(items);
+        if (currentLists.length > 0) saveCachedTaskLists(currentLists);
         setTasksPermissionError(null);
+        setIsSessionExpired(false);
       } catch (err: any) {
         console.error('Błąd pobierania zadań:', err);
         const msg = err.message || 'Błąd pobierania zadań';
-        if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
+        if (msg.includes('401') || msg.includes('wygasła')) {
+          setIsSessionExpired(true);
+        } else if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
           setTasksPermissionError(msg);
         }
         addLog(`Błąd pobierania zadań: ${msg}`, 'error');
@@ -570,12 +863,17 @@ export default function App() {
 
         const eventItems = await getEventsForCalendars(authToken, targetIds, currentCalendars);
         setEvents(eventItems);
+        saveCachedEvents(eventItems);
+        if (currentCalendars.length > 0) saveCachedCalendars(currentCalendars);
         setLastSyncTime(new Date());
         setCalendarPermissionError(null);
+        setIsSessionExpired(false);
       } catch (err: any) {
         console.error('Błąd pobierania wydarzeń:', err);
         const msg = err.message || 'Błąd kalendarza';
-        if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
+        if (msg.includes('401') || msg.includes('wygasła')) {
+          setIsSessionExpired(true);
+        } else if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
           setCalendarPermissionError(msg);
         }
         addLog(`Błąd kalendarza: ${msg}`, 'error');
@@ -634,7 +932,9 @@ export default function App() {
       } catch (calErr: any) {
         console.error('Błąd kalendarza:', calErr);
         const msg = calErr.message || 'Błąd kalendarza';
-        if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
+        if (msg.includes('401') || msg.includes('wygasła')) {
+          setIsSessionExpired(true);
+        } else if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
           setCalendarPermissionError(msg);
         }
         addLog(`Kalendarz Google: ${msg}`, 'error');
@@ -665,7 +965,9 @@ export default function App() {
       } catch (tasksErr: any) {
         console.error('Błąd listy zadań:', tasksErr);
         const msg = tasksErr.message || 'Błąd listy zadań';
-        if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
+        if (msg.includes('401') || msg.includes('wygasła')) {
+          setIsSessionExpired(true);
+        } else if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
           setTasksPermissionError(msg);
         }
         addLog(`Zadania Google: ${msg}`, 'error');
@@ -726,13 +1028,14 @@ export default function App() {
     };
   }, [token, autoSync, selectedCalendarIds, addLog]);
 
-  // Manual Refresh Events - robustly fetches fresh calendars and events
-  const handleRefreshEvents = async (overrideCalendarIds?: string[]) => {
-    if (!token) return;
+  // Manual & Auto Refresh Events - robustly fetches fresh calendars and events
+  const handleRefreshEvents = useCallback(async (overrideCalendarIds?: string[]) => {
+    const activeToken = token || getStoredAuth()?.token;
+    if (!activeToken) return;
     try {
       setIsLoadingEvents(true);
       addLog('Odświeżanie kalendarzy i wydarzeń z Google...', 'info');
-      const freshCalendars = await listUserCalendars(token);
+      const freshCalendars = await listUserCalendars(activeToken);
       setCalendars(freshCalendars);
 
       const targetIds =
@@ -742,30 +1045,36 @@ export default function App() {
             ? selectedCalendarIds
             : [ALL_CALENDARS_ID];
 
-      const eventItems = await getEventsForCalendars(token, targetIds, freshCalendars);
+      const eventItems = await getEventsForCalendars(activeToken, targetIds, freshCalendars);
       setEvents(eventItems);
+      saveCachedEvents(eventItems);
+      if (freshCalendars.length > 0) saveCachedCalendars(freshCalendars);
       setLastSyncTime(new Date());
       setCalendarPermissionError(null);
+      setIsSessionExpired(false);
       addLog(`Odświeżono kalendarz: załadowano ${eventItems.length} wydarzeń`, 'success');
     } catch (err: any) {
       console.error('Błąd odświeżania kalendarza:', err);
       const msg = err.message || 'Błąd odświeżania kalendarza';
-      if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
+      if (msg.includes('401') || msg.includes('wygasła')) {
+        setIsSessionExpired(true);
+      } else if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
         setCalendarPermissionError(msg);
       }
       addLog(`Błąd odświeżania kalendarza: ${msg}`, 'error');
     } finally {
       setIsLoadingEvents(false);
     }
-  };
+  }, [token, selectedCalendarIds, addLog]);
 
-  // Manual Refresh Tasks - robustly fetches fresh lists and tasks
-  const handleRefreshTasks = async (overrideTaskListIds?: string[]) => {
-    if (!token) return;
+  // Manual & Auto Refresh Tasks - robustly fetches fresh lists and tasks
+  const handleRefreshTasks = useCallback(async (overrideTaskListIds?: string[]) => {
+    const activeToken = token || getStoredAuth()?.token;
+    if (!activeToken) return;
     try {
       setIsLoadingTasks(true);
       addLog('Odświeżanie list zadań i pozycji z Google...', 'info');
-      const freshLists = await listTaskLists(token);
+      const freshLists = await listTaskLists(activeToken);
       setTaskLists(freshLists);
 
       const targetListIds =
@@ -779,31 +1088,199 @@ export default function App() {
 
       let taskItems: GoogleTaskItem[] = [];
       if (targetListIds.includes(ALL_TASK_LISTS_ID)) {
-        taskItems = await getAllTaskListsTasks(token, freshLists);
+        taskItems = await getAllTaskListsTasks(activeToken, freshLists);
       } else {
-        taskItems = await getTasksForSelectedLists(token, targetListIds, freshLists);
+        taskItems = await getTasksForSelectedLists(activeToken, targetListIds, freshLists);
       }
       setTasks(taskItems);
+      saveCachedTasks(taskItems);
+      if (freshLists.length > 0) saveCachedTaskLists(freshLists);
       setTasksPermissionError(null);
+      setIsSessionExpired(false);
       addLog(`Odświeżono zadania: załadowano ${taskItems.length} pozycji`, 'success');
     } catch (err: any) {
       console.error('Błąd odświeżania zadań:', err);
       const msg = err.message || 'Błąd odświeżania zadań';
-      if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
+      if (msg.includes('401') || msg.includes('wygasła')) {
+        setIsSessionExpired(true);
+      } else if (msg.includes('403') || msg.toLowerCase().includes('brak uprawnień')) {
         setTasksPermissionError(msg);
       }
       addLog(`Błąd odświeżania zadań: ${msg}`, 'error');
     } finally {
       setIsLoadingTasks(false);
     }
-  };
+  }, [token, selectedTaskListIds, travelTaskList, addLog]);
+
+  // Stable refs for auto-refresh to prevent dependency churn and infinite loops
+  const lastAutoRefreshRef = useRef<number>(Date.now());
+  const isAutoRefreshingRef = useRef<boolean>(false);
+  const handleRefreshEventsRef = useRef(handleRefreshEvents);
+  handleRefreshEventsRef.current = handleRefreshEvents;
+  const handleRefreshTasksRef = useRef(handleRefreshTasks);
+  handleRefreshTasksRef.current = handleRefreshTasks;
+
+  // Automatyczne odświeżanie kalendarzy i zadań przy wznowieniu aplikacji (visibilitychange)
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState !== 'visible') return;
+
+      const now = Date.now();
+      // 15-sekundowy cooldown chroniący przed jakimikolwiek pętlami na urządzeniach mobilnych
+      if (now - lastAutoRefreshRef.current < 15000) return;
+      if (isAutoRefreshingRef.current) return;
+      lastAutoRefreshRef.current = now;
+
+      const activeToken = token || getStoredAuth()?.token;
+      if (!activeToken) return;
+
+      isAutoRefreshingRef.current = true;
+      try {
+        if (isStoredTokenExpired()) {
+          const freshToken = await refreshGoogleTokenSilently();
+          if (!freshToken) {
+            setIsSessionExpired(true);
+            return;
+          }
+        }
+
+        await Promise.allSettled([
+          handleRefreshEventsRef.current(),
+          handleRefreshTasksRef.current(),
+        ]);
+      } catch (err) {
+        console.warn('Błąd auto-refresh przy wznowieniu:', err);
+      } finally {
+        isAutoRefreshingRef.current = false;
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [token]);
 
   // Switch App Navigation Tab
-  const handleSelectTab = (tab: AppNavTab) => {
+  const handleSelectTab = (tab: AppNavTab, isBackNav = false) => {
+    if (!isBackNav && tab !== currentTab) {
+      navHistoryRef.current.push(tab);
+      try {
+        window.history.pushState({ appTab: tab }, '');
+      } catch (e) {}
+    }
     setCurrentTab(tab);
     setIsAppSidebarOpen(false);
     localStorage.setItem('travel_app_active_tab', tab);
+    if (tab === 'calendar') {
+      const savedMode = (localStorage.getItem('travel_calendar_view_mode') as string) || 'miesiac';
+      const defaultRange = savedMode === 'harmonogram' ? getDefaultDateRange() : getCalendarViewDefaultDateRange();
+      setFullCalendarDateRange(defaultRange);
+    }
   };
+
+  // Obsługa skrótów klawiszowych:
+  // d - widok dnia w kalendarzu
+  // m - widok miesiąca w kalendarzu
+  // x - widok 4 tygodni w kalendarzu
+  // w - widok tygodnia w kalendarzu
+  // n - nowe wydarzenie
+  // m - nowe zadanie (w zakładce zadania)
+  // p - widok pulpitu
+  // s - widok szablonu
+  // k - widok kalendarza
+  // z - widok zadań
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      // Nie uruchamiaj skrótów podczas pisania w polach tekstowych
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable ||
+          target.closest('input, textarea, select, [contenteditable="true"]'))
+      ) {
+        return;
+      }
+
+      // Nie przechwytuj kombinacji ze specjalnymi modyfikatorami (Ctrl, Cmd, Alt)
+      if (e.ctrlKey || e.metaKey || e.altKey) {
+        return;
+      }
+
+      const key = e.key.toLowerCase();
+
+      if (key === 'p') {
+        e.preventDefault();
+        handleSelectTab('dashboard');
+      } else if (key === 's') {
+        e.preventDefault();
+        handleSelectTab('templates');
+      } else if (key === 'k') {
+        e.preventDefault();
+        handleSelectTab('calendar');
+      } else if (key === 'z') {
+        e.preventDefault();
+        handleSelectTab('tasks');
+      } else if (key === 'd') {
+        e.preventDefault();
+        if (currentTab !== 'calendar') {
+          handleSelectTab('calendar');
+        }
+        localStorage.setItem('travel_calendar_view_mode', 'dzien');
+        window.dispatchEvent(new CustomEvent('app:switch-calendar-view', { detail: { mode: 'dzien' } }));
+      } else if (key === 'w') {
+        e.preventDefault();
+        if (currentTab !== 'calendar') {
+          handleSelectTab('calendar');
+        }
+        localStorage.setItem('travel_calendar_view_mode', 'tydzien');
+        window.dispatchEvent(new CustomEvent('app:switch-calendar-view', { detail: { mode: 'tydzien' } }));
+      } else if (key === 'x') {
+        e.preventDefault();
+        if (currentTab !== 'calendar') {
+          handleSelectTab('calendar');
+        }
+        localStorage.setItem('travel_calendar_view_mode', '4tygodnie');
+        window.dispatchEvent(new CustomEvent('app:switch-calendar-view', { detail: { mode: '4tygodnie' } }));
+      } else if (key === 'n') {
+        e.preventDefault();
+        if (currentTab !== 'calendar') {
+          handleSelectTab('calendar');
+        }
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('app:open-new-event'));
+        }, 50);
+      } else if (key === 'm') {
+        e.preventDefault();
+        if (currentTab === 'tasks') {
+          // w widoku zadań: m -> nowe zadanie
+          window.dispatchEvent(new CustomEvent('app:open-new-task'));
+        } else {
+          // w kalendarzu lub pozostałych: m -> widok miesiąca w kalendarzu
+          if (currentTab !== 'calendar') {
+            handleSelectTab('calendar');
+          }
+          localStorage.setItem('travel_calendar_view_mode', 'miesiac');
+          window.dispatchEvent(new CustomEvent('app:switch-calendar-view', { detail: { mode: 'miesiac' } }));
+        }
+      } else if (key === 't') {
+        // Pomocniczy alias klawisza t -> nowe zadanie
+        e.preventDefault();
+        if (currentTab !== 'tasks') {
+          handleSelectTab('tasks');
+        }
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('app:open-new-task'));
+        }, 50);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [currentTab]);
 
   // Change active calendar
   const handleSelectCalendar = async (cal: CalendarListItem) => {
@@ -1000,6 +1477,8 @@ export default function App() {
 
       let tasksCreated = 0;
       let calendarEventsCreated = 0;
+      const createdTaskRecords: Array<{ id: string; listId: string }> = [];
+      const createdCalRecords: Array<{ id: string; calId: string }> = [];
 
       for (let i = 0; i < itemsToProcess.length; i++) {
         const itemChoice = itemsToProcess[i];
@@ -1018,11 +1497,12 @@ export default function App() {
         // 1. Create Google Task if chosen (clean title, no notes)
         if (itemChoice.createTask) {
           const specificTaskListId = item.targetTaskListId || targetTaskList.id;
-          await createGoogleTask(token, specificTaskListId, {
+          const createdTask = await createGoogleTask(token, specificTaskListId, {
             title: cleanTitle,
             notes: undefined,
             due: dueDetails.rfc3339,
           });
+          createdTaskRecords.push({ id: createdTask.id, listId: specificTaskListId });
           tasksCreated++;
         }
 
@@ -1037,7 +1517,7 @@ export default function App() {
 
         if (itemChoice.createCalendarEvent && destCalendarId && taskHour) {
           try {
-            await createCalendarEvent(token, destCalendarId, {
+            const createdCal = await createCalendarEvent(token, destCalendarId, {
               summary: cleanTitle,
               description: `Zadanie do wydarzenia "${event.summary}". Godzina wykonania: ${taskHour}.${item.notes ? `\n\n${item.notes}` : ''}`,
               colorId: item.colorId || undefined,
@@ -1050,6 +1530,7 @@ export default function App() {
                 timeZone: dueDetails.timeZone,
               },
             });
+            createdCalRecords.push({ id: createdCal.id, calId: destCalendarId });
             calendarEventsCreated++;
           } catch (calErr: any) {
             console.warn('Nie udało się utworzyć wpisu w Kalendarzu Google:', calErr);
@@ -1076,6 +1557,37 @@ export default function App() {
         `Sukces! Utworzono ${tasksCreated} zadań w Google Tasks oraz ${calendarEventsCreated} wydarzeń z datą w Kalendarzu Google dla wydarzenia "${event.summary}"!`,
         'success'
       );
+
+      // Register undo action for generated batch
+      pushAction({
+        type: 'GENERATE_TASKS',
+        title: `Wygenerowano zadania dla "${event.summary}" (${tasksCreated})`,
+        undo: async () => {
+          for (const rec of createdTaskRecords) {
+            try {
+              await deleteGoogleTask(token, rec.listId, rec.id);
+            } catch (e) {}
+          }
+          for (const rec of createdCalRecords) {
+            try {
+              await deleteCalendarEvent(token, rec.calId, rec.id);
+            } catch (e) {}
+          }
+          setTasks((prev) => prev.filter((t) => !createdTaskRecords.some((r) => r.id === t.id)));
+          setEvents((prev) => prev.filter((e) => !createdCalRecords.some((r) => r.id === e.id)));
+          setGeneratedTripMap((prev) => {
+            const next = { ...prev };
+            delete next[event.id];
+            localStorage.setItem('travel_generated_trip_ids', JSON.stringify(next));
+            return next;
+          });
+          addLog(`Cofnięto wygenerowane zadania dla "${event.summary}"`, 'info');
+          await fetchTasks(token, targetTaskList.id);
+          if (selectedCalendar) {
+            await fetchEvents(token, selectedCalendar.id);
+          }
+        },
+      });
 
       // Refresh task list & calendar
       await fetchTasks(token, targetTaskList.id);
@@ -1135,6 +1647,7 @@ export default function App() {
         : taskLists.find((tl) => tl.id !== ALL_TASK_LISTS_ID)?.id || '');
     if (!effectiveListId) return;
 
+    const previousStatus = task.status;
     const nextStatus = task.status === 'completed' ? 'needsAction' : 'completed';
 
     setTasks((prev) =>
@@ -1147,6 +1660,25 @@ export default function App() {
         `Zadanie "${task.title}" oznaczono jako ${nextStatus === 'completed' ? 'ukończone' : 'do zrobienia'}`,
         'info'
       );
+
+      pushAction({
+        type: 'TOGGLE_TASK',
+        title: nextStatus === 'completed' ? `Ukończono: "${task.title}"` : `Przywrócono: "${task.title}"`,
+        undo: async () => {
+          setTasks((prev) =>
+            prev.map((t) => (t.id === task.id ? { ...t, status: previousStatus } : t))
+          );
+          await updateTaskStatus(token, effectiveListId, task.id, previousStatus);
+          addLog(`Cofnięto zmianę statusu zadania "${task.title}"`, 'info');
+        },
+        redo: async () => {
+          setTasks((prev) =>
+            prev.map((t) => (t.id === task.id ? { ...t, status: nextStatus } : t))
+          );
+          await updateTaskStatus(token, effectiveListId, task.id, nextStatus);
+          addLog(`Ponowiono zmianę statusu zadania "${task.title}"`, 'info');
+        },
+      });
     } catch (err: any) {
       console.error(err);
       setTasks((prev) =>
@@ -1160,8 +1692,9 @@ export default function App() {
   const handleDeleteTask = async (taskId: string) => {
     if (!token) return;
     const target = tasks.find((t) => t.id === taskId);
+    if (!target) return;
     const effectiveListId =
-      target?.taskListId ||
+      target.taskListId ||
       (travelTaskList && travelTaskList.id !== ALL_TASK_LISTS_ID
         ? travelTaskList.id
         : taskLists.find((tl) => tl.id !== ALL_TASK_LISTS_ID)?.id || '');
@@ -1173,6 +1706,32 @@ export default function App() {
     try {
       await deleteGoogleTask(token, effectiveListId, taskId);
       addLog('Zadanie zostało usunięte z Google Tasks', 'info');
+
+      pushAction({
+        type: 'DELETE_TASK',
+        title: `Usunięto zadanie: "${target.title}"`,
+        undo: async () => {
+          const restored = await createGoogleTask(token, effectiveListId, {
+            title: target.title,
+            notes: target.notes,
+            due: target.due,
+          });
+          if (target.status === 'completed') {
+            await updateTaskStatus(token, effectiveListId, restored.id, 'completed');
+          }
+          const restoredTask: GoogleTaskItem = {
+            ...target,
+            id: restored.id,
+          };
+          setTasks((prev) => [restoredTask, ...prev]);
+          addLog(`Przywrócono zadanie "${target.title}"`, 'success');
+        },
+        redo: async () => {
+          await deleteGoogleTask(token, effectiveListId, taskId);
+          setTasks((prev) => prev.filter((t) => t.id !== taskId));
+          addLog(`Ponownie usunięto zadanie "${target.title}"`, 'info');
+        },
+      });
     } catch (err: any) {
       setTasks(previous);
       addLog(`Nie udało się usunąć zadania: ${err.message}`, 'error');
@@ -1243,55 +1802,94 @@ export default function App() {
     }
   };
 
-  // Add task to Google Calendar with +1h duration (start from template/custom hour, end = start + 1h)
-  const handleAddTaskToCalendar = async (task: GoogleTaskItem, startTime?: string, colorId?: string) => {
-    if (!token || !selectedCalendar) {
-      addLog('Brak aktywnego kalendarza do dodania terminu.', 'error');
+  // Add task to Google Calendar (all-day event or with +1h duration if time is specified)
+  const handleAddTaskToCalendar = async (
+    task: GoogleTaskItem,
+    startTime?: string,
+    colorId?: string,
+    targetCalendarIdOverride?: string,
+    isAllDay?: boolean
+  ) => {
+    if (!token) {
+      addLog('Brak aktywnego tokenu do dodania terminu.', 'error');
       return;
     }
     try {
       const cleanTitle = cleanTaskTitle(task.title);
-      let taskHour = startTime || '18:00';
+      const { time: extractedTime } = extractTaskTitleAndTime(task.title, task.notes, templates, task.due);
       const matchedTpl = templates.find(
         (t) => cleanTaskTitle(t.title).toLowerCase() === cleanTitle.toLowerCase()
       );
-      if (!startTime) {
-        if (matchedTpl?.time) {
-          taskHour = matchedTpl.time;
-        }
-      }
       const eventColorId = colorId || matchedTpl?.colorId || undefined;
 
       // Determine date
       let baseDate = new Date();
       if (task.due) {
-        baseDate = new Date(task.due);
+        const localDateStr = extractLocalDateStr(task.due);
+        const [yy, mm, dd] = localDateStr.split('-').map(Number);
+        baseDate = new Date(yy, mm - 1, dd);
       } else {
         baseDate.setDate(baseDate.getDate() + 1);
       }
 
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const targetDateStr = `${baseDate.getFullYear()}-${pad(baseDate.getMonth() + 1)}-${pad(baseDate.getDate())}`;
+
+      const targetCalendarId =
+        targetCalendarIdOverride ||
+        (selectedCalendar && selectedCalendar.id !== ALL_CALENDARS_ID
+          ? selectedCalendar.id
+          : (findPrimaryCalendar(calendars)?.id || 'primary'));
+
+      const targetCalObj = calendars.find((c) => c.id === targetCalendarId);
+      const targetCalName = targetCalObj?.summary ? ` (${targetCalObj.summary})` : '';
+
+      // If all-day is requested OR no explicit hour was specified and task doesn't have an extracted hour
+      if (isAllDay || (!startTime && !extractedTime)) {
+        const { start, end } = formatCalendarEventStartEnd(
+          {
+            startDate: targetDateStr,
+            endDate: targetDateStr,
+            isAllDay: true,
+          },
+          false
+        );
+
+        await createCalendarEvent(token, targetCalendarId, {
+          summary: cleanTitle,
+          description: task.notes?.trim() ? task.notes : undefined,
+          colorId: eventColorId,
+          start,
+          end,
+        });
+
+        addLog(
+          `Dodano całodniowe zadanie do Kalendarza Google${targetCalName}: "${cleanTitle}"`,
+          'success'
+        );
+        if (selectedCalendar) {
+          await fetchEvents(token, selectedCalendar.id);
+        }
+        return;
+      }
+
+      let taskHour = startTime || extractedTime || matchedTpl?.time || '18:00';
       const [hh, mm] = taskHour.split(':').map(Number);
       const startDt = new Date(baseDate);
       startDt.setHours(isNaN(hh) ? 18 : hh, isNaN(mm) ? 0 : mm, 0, 0);
 
-      // Duration: exactly 30 min
-      const endDt = new Date(startDt.getTime() + 30 * 60 * 1000);
+      // Duration: 1 hour (+1h)
+      const endDt = new Date(startDt.getTime() + 60 * 60 * 1000);
 
-      const pad = (n: number) => String(n).padStart(2, '0');
       const startIso = `${startDt.getFullYear()}-${pad(startDt.getMonth() + 1)}-${pad(startDt.getDate())}T${pad(startDt.getHours())}:${pad(startDt.getMinutes())}:00`;
       const endIso = `${endDt.getFullYear()}-${pad(endDt.getMonth() + 1)}-${pad(endDt.getDate())}T${pad(endDt.getHours())}:${pad(endDt.getMinutes())}:00`;
 
       const startFormatted = `${pad(startDt.getHours())}:${pad(startDt.getMinutes())}`;
       const endFormatted = `${pad(endDt.getHours())}:${pad(endDt.getMinutes())}`;
 
-      const targetCalendarId =
-        selectedCalendar.id === ALL_CALENDARS_ID
-          ? (findPrimaryCalendar(calendars)?.id || 'primary')
-          : selectedCalendar.id;
-
       await createCalendarEvent(token, targetCalendarId, {
         summary: cleanTitle,
-        description: `Termin zadania z listy "${travelTaskList?.title || 'Zadania'}". Czas trwania: 30 min (${startFormatted} - ${endFormatted}).${task.notes ? `\n\nNotatki: ${task.notes}` : ''}`,
+        description: `Termin zadania z listy "${travelTaskList?.title || 'Zadania'}". Czas trwania: 1h (${startFormatted} - ${endFormatted}).${task.notes ? `\n\nNotatki: ${task.notes}` : ''}`,
         colorId: eventColorId,
         start: {
           dateTime: startIso,
@@ -1304,10 +1902,12 @@ export default function App() {
       });
 
       addLog(
-        `Dodano termin do Kalendarza Google: "${cleanTitle}" (${startFormatted} - ${endFormatted}, czas trwania: 30 min)`,
+        `Dodano termin do Kalendarza Google${targetCalName}: "${cleanTitle}" (${startFormatted} - ${endFormatted}, czas trwania: 1h)`,
         'success'
       );
-      await fetchEvents(token, selectedCalendar.id);
+      if (selectedCalendar) {
+        await fetchEvents(token, selectedCalendar.id);
+      }
     } catch (err: any) {
       addLog(`Błąd dodawania terminu do Kalendarza: ${err.message}`, 'error');
       throw err;
@@ -1348,6 +1948,40 @@ export default function App() {
         }
       }
       addLog('Wydarzenie zostało pomyślnie usunięte z Kalendarza Google.', 'success');
+
+      if (existing) {
+        pushAction({
+          type: 'DELETE_EVENT',
+          title: `Usunięto wydarzenie: "${existing.summary}"`,
+          undo: async () => {
+            const restored = await createCalendarEvent(token, targetCalendarId, {
+              summary: existing.summary,
+              description: existing.description,
+              location: existing.location,
+              colorId: existing.colorId,
+              start: existing.start,
+              end: existing.end,
+            });
+            const calObj = calendars.find((c) => c.id === targetCalendarId);
+            const restoredItem: CalendarEventItem = {
+              ...restored,
+              colorId: existing.colorId,
+              calendarId: targetCalendarId,
+              calendarSummary: calObj?.summary || 'Kalendarz',
+            };
+            setEvents((prev) => [restoredItem, ...prev]);
+            addLog(`Przywrócono wydarzenie "${existing.summary}"`, 'success');
+            await fetchEvents(token, undefined, selectedCalendarIds);
+          },
+          redo: async () => {
+            try {
+              await deleteCalendarEvent(token, targetCalendarId, eventId);
+            } catch (e) {}
+            setEvents((prev) => prev.filter((e) => e.id !== eventId));
+            addLog(`Ponownie usunięto wydarzenie "${existing.summary}"`, 'info');
+          },
+        });
+      }
     } catch (err: any) {
       addLog(`Nie udało się usunąć wydarzenia: ${err.message}`, 'error');
       throw err;
@@ -1372,34 +2006,16 @@ export default function App() {
       return;
     }
     try {
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Warsaw';
-      let start: any;
-      let end: any;
-
-      if (payload.isAllDay) {
-        start = { date: payload.startDate };
-        end = { date: payload.endDate || payload.startDate };
-      } else {
-        const sTime = payload.startTime || '09:00';
-        // Default 30 min duration
-        let eTime = payload.endTime;
-        if (!eTime) {
-          const [h, m] = sTime.split(':').map(Number);
-          const totalMin = (isNaN(h) ? 9 : h) * 60 + (isNaN(m) ? 0 : m) + 30;
-          const endH = Math.floor(totalMin / 60) % 24;
-          const endM = totalMin % 60;
-          const pad = (n: number) => String(n).padStart(2, '0');
-          eTime = `${pad(endH)}:${pad(endM)}`;
-        }
-        start = {
-          dateTime: `${payload.startDate}T${sTime}:00`,
-          timeZone: tz,
-        };
-        end = {
-          dateTime: `${payload.endDate || payload.startDate}T${eTime}:00`,
-          timeZone: tz,
-        };
-      }
+      const { start, end } = formatCalendarEventStartEnd(
+        {
+          startDate: payload.startDate,
+          endDate: payload.endDate,
+          startTime: payload.startTime,
+          endTime: payload.endTime,
+          isAllDay: payload.isAllDay,
+        },
+        false
+      );
 
       const targetCalendarId =
         payload.calendarId ||
@@ -1429,6 +2045,39 @@ export default function App() {
 
       addLog(`Dodano wydarzenie "${payload.summary}" do Kalendarza Google.`, 'success');
       await fetchEvents(token, undefined, selectedCalendarIds);
+
+      pushAction({
+        type: 'CREATE_EVENT',
+        title: `Utworzono wydarzenie: "${payload.summary}"`,
+        undo: async () => {
+          try {
+            await deleteCalendarEvent(token, targetCalendarId, enhancedItem.id);
+          } catch (e) {}
+          setEvents((prev) => prev.filter((e) => e.id !== enhancedItem.id));
+          addLog(`Cofnięto utworzenie wydarzenia "${payload.summary}"`, 'info');
+          await fetchEvents(token, undefined, selectedCalendarIds);
+        },
+        redo: async () => {
+          const rec = await createCalendarEvent(token, targetCalendarId, {
+            summary: payload.summary,
+            location: payload.location,
+            description: payload.description,
+            colorId: payload.colorId,
+            start,
+            end,
+          });
+          const recItem: CalendarEventItem = {
+            ...rec,
+            colorId: payload.colorId !== undefined ? payload.colorId : rec.colorId,
+            calendarId: targetCalendarId,
+            calendarSummary: calObj?.summary || 'Kalendarz',
+          };
+          setEvents((prev) => [recItem, ...prev]);
+          addLog(`Ponowiono utworzenie wydarzenia "${payload.summary}"`, 'success');
+          await fetchEvents(token, undefined, selectedCalendarIds);
+        },
+      });
+
       return enhancedItem;
     } catch (err: any) {
       addLog(`Błąd podczas dodawania wydarzenia do kalendarza: ${err.message}`, 'error');
@@ -1457,33 +2106,13 @@ export default function App() {
       return;
     }
     try {
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Warsaw';
-      let start: any;
-      let end: any;
-
-      if (payload.isAllDay) {
-        start = { date: payload.startDate };
-        end = { date: payload.endDate || payload.startDate };
-      } else {
-        const sTime = payload.startTime || '09:00';
-        let eTime = payload.endTime;
-        if (!eTime) {
-          const [h, m] = sTime.split(':').map(Number);
-          const totalMin = (isNaN(h) ? 9 : h) * 60 + (isNaN(m) ? 0 : m) + 30;
-          const endH = Math.floor(totalMin / 60) % 24;
-          const endM = totalMin % 60;
-          const pad = (n: number) => String(n).padStart(2, '0');
-          eTime = `${pad(endH)}:${pad(endM)}`;
-        }
-        start = {
-          dateTime: `${payload.startDate}T${sTime}:00`,
-          timeZone: tz,
-        };
-        end = {
-          dateTime: `${payload.endDate || payload.startDate}T${eTime}:00`,
-          timeZone: tz,
-        };
-      }
+      const { start, end } = formatCalendarEventStartEnd({
+        startDate: payload.startDate,
+        endDate: payload.endDate,
+        startTime: payload.startTime,
+        endTime: payload.endTime,
+        isAllDay: payload.isAllDay,
+      });
 
       const existing = events.find((e) => e.id === eventId);
       const sourceCalendarId =
@@ -1491,6 +2120,14 @@ export default function App() {
         (selectedCalendar.id === ALL_CALENDARS_ID
           ? (findPrimaryCalendar(calendars)?.id || 'primary')
           : selectedCalendar.id);
+
+      const prevSummary = existing?.summary || payload.summary;
+      const prevLocation = existing?.location;
+      const prevDesc = existing?.description;
+      const prevColorId = existing?.colorId;
+      const prevStart = existing?.start;
+      const prevEnd = existing?.end;
+      const prevCalendarId = existing?.calendarId || sourceCalendarId;
 
       const targetCalendarId = payload.calendarId || sourceCalendarId;
 
@@ -1536,6 +2173,48 @@ export default function App() {
 
       addLog(`Zaktualizowano wydarzenie "${payload.summary}" w Kalendarzu Google.`, 'success');
       await fetchEvents(token, undefined, selectedCalendarIds);
+
+      if (existing && prevStart && prevEnd) {
+        pushAction({
+          type: 'UPDATE_EVENT',
+          title: `Zaktualizowano wydarzenie: "${payload.summary}"`,
+          undo: async () => {
+            await updateCalendarEvent(token, targetCalendarId, eventId, {
+              summary: prevSummary,
+              location: prevLocation,
+              description: prevDesc,
+              colorId: prevColorId,
+              start: prevStart,
+              end: prevEnd,
+            });
+            if (prevCalendarId && prevCalendarId !== targetCalendarId) {
+              try {
+                await moveCalendarEvent(token, targetCalendarId, eventId, prevCalendarId);
+              } catch (e) {}
+            }
+            await fetchEvents(token, undefined, selectedCalendarIds);
+            addLog(`Cofnięto aktualizację wydarzenia "${prevSummary}"`, 'info');
+          },
+          redo: async () => {
+            await updateCalendarEvent(token, sourceCalendarId, eventId, {
+              summary: payload.summary,
+              location: payload.location,
+              description: payload.description,
+              colorId: payload.colorId,
+              start,
+              end,
+            });
+            if (payload.calendarId && payload.calendarId !== sourceCalendarId) {
+              try {
+                await moveCalendarEvent(token, sourceCalendarId, eventId, payload.calendarId);
+              } catch (e) {}
+            }
+            await fetchEvents(token, undefined, selectedCalendarIds);
+            addLog(`Ponowiono aktualizację wydarzenia "${payload.summary}"`, 'info');
+          },
+        });
+      }
+
       return enhancedItem;
     } catch (err: any) {
       addLog(`Błąd podczas aktualizacji wydarzenia w kalendarzu: ${err.message}`, 'error');
@@ -1577,6 +2256,32 @@ export default function App() {
         `Dodano nowe zadanie "${cleanTitle}" do listy "${targetListObj?.title || effectiveListId}"`,
         'success'
       );
+
+      pushAction({
+        type: 'CREATE_TASK',
+        title: `Utworzono zadanie: "${cleanTitle}"`,
+        undo: async () => {
+          try {
+            await deleteGoogleTask(token, effectiveListId, newTask.id);
+          } catch (e) {}
+          setTasks((prev) => prev.filter((t) => t.id !== newTask.id));
+          addLog(`Cofnięto utworzenie zadania "${cleanTitle}"`, 'info');
+        },
+        redo: async () => {
+          const recreated = await createGoogleTask(token, effectiveListId, {
+            title: cleanTitle,
+            notes: notes || undefined,
+            due,
+          });
+          const recreatedTask: GoogleTaskItem = {
+            ...recreated,
+            taskListId: effectiveListId,
+            taskListTitle: targetListObj?.title || 'Zadania',
+          };
+          setTasks((prev) => [recreatedTask, ...prev]);
+          addLog(`Ponowiono utworzenie zadania "${cleanTitle}"`, 'info');
+        },
+      });
     } catch (err: any) {
       addLog(`Nie udało się dodać zadania: ${err.message}`, 'error');
       throw err;
@@ -1674,12 +2379,12 @@ export default function App() {
       let created = 0;
 
       for (const task of activeTasks) {
-        const { time: extractedTime, cleanTitle } = extractTaskTitleAndTime(task.title, task.notes, templates);
+        const { time: extractedTime, cleanTitle } = extractTaskTitleAndTime(task.title, task.notes, templates, task.due);
         const resolvedTime = extractedTime || '18:00';
 
         let datePart = '';
         if (task.due) {
-          datePart = task.due.includes('T') ? task.due.split('T')[0] : task.due;
+          datePart = extractLocalDateStr(task.due);
         } else {
           const tomorrow = new Date();
           tomorrow.setDate(tomorrow.getDate() + 1);
@@ -1879,7 +2584,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-neutral-100/70 text-neutral-900 font-sans flex flex-col w-full overflow-x-clip">
+    <div className={`min-h-screen ${currentTab === 'calendar' || currentTab === 'tasks' ? 'h-screen max-h-screen overflow-hidden' : ''} bg-neutral-100/70 text-neutral-900 font-sans flex flex-col w-full overflow-x-clip`}>
       <Navbar
         user={user}
         onLogout={handleLogout}
@@ -1892,11 +2597,77 @@ export default function App() {
         tasksCount={tasks.filter((t) => t.status === 'needsAction').length}
         isSidebarOpen={isAppSidebarOpen}
         onToggleSidebar={handleToggleAppSidebar}
+        onOpenWidgetsModal={() => setShowWidgetsModal(true)}
       />
+
+      {/* Session Expired Banner with One-Click Reauthorization */}
+      {isSessionExpired && user && (
+        <div className="bg-amber-500 text-amber-950 px-3 sm:px-4 py-2 flex items-center justify-between gap-2 text-xs sm:text-sm font-medium shadow-md shrink-0 z-30 animate-in slide-in-from-top-1 border-b border-amber-600">
+          <div className="flex items-center space-x-2 min-w-0">
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-900 animate-pulse shrink-0" />
+            <span className="font-bold text-amber-950 truncate">
+              Sesja Google wygasła. Wyświetlane są dane z pamięci urządzenia.
+            </span>
+            <span className="hidden md:inline text-amber-900 text-xs">
+              (kliknij, aby zsynchronizować najświeższe wydarzenia i zadania)
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={handleQuickReauthorize}
+            disabled={isSigningIn}
+            className="inline-flex items-center space-x-1.5 px-3 py-1 bg-neutral-900 hover:bg-neutral-800 active:bg-black text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer active:scale-95 shrink-0"
+          >
+            <span>Odśwież uprawnienia Google (1 kliknięcie)</span>
+          </button>
+        </div>
+      )}
+
+      {activeWidgetConfig && (
+        <div className="bg-gradient-to-r from-blue-700 via-indigo-700 to-blue-800 text-white px-3 sm:px-4 py-2 flex items-center justify-between text-xs shadow-md shrink-0 z-30 animate-in slide-in-from-top-1">
+          <div className="flex items-center space-x-2 min-w-0">
+            <span className="px-2 py-0.5 rounded-full bg-white/20 font-bold text-[10px] uppercase tracking-wider shrink-0 flex items-center gap-1">
+              <Smartphone className="w-3 h-3" />
+              Widget
+            </span>
+            <span className="font-bold text-xs sm:text-sm truncate">
+              {activeWidgetConfig.name}
+            </span>
+            <span className="text-[11px] text-blue-200 hidden md:inline truncate">
+              • {activeWidgetConfig.description}
+            </span>
+          </div>
+          <div className="flex items-center space-x-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setEditingWidgetInBar(activeWidgetConfig)}
+              className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-white/15 hover:bg-white/25 text-white font-semibold cursor-pointer transition active:scale-95 text-xs"
+              title="Dostosuj widoczność kalendarzy, list zadań i terminów dla tego widgetu"
+            >
+              <Sliders className="w-3.5 h-3.5" />
+              <span>Edytuj widget</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveWidgetConfig(null);
+                const url = new URL(window.location.href);
+                url.searchParams.delete('widget');
+                window.history.replaceState({}, '', url.toString());
+              }}
+              className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-blue-100 hover:text-white transition cursor-pointer text-xs"
+              title="Przejdź do pełnego widoku aplikacji"
+            >
+              <X className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Zamknij widget</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       <main className={
         currentTab === 'calendar' || currentTab === 'tasks'
-          ? "flex-1 w-full h-[calc(100dvh-4rem)] p-2 sm:p-3 overflow-hidden flex flex-col min-h-0"
+          ? "flex-1 w-full min-h-0 overflow-hidden flex flex-col p-1.5 sm:p-2.5"
           : "flex-1 w-full mx-auto px-2 sm:px-4 md:px-6 lg:px-8 max-w-full lg:max-w-7xl 2xl:max-w-[1536px] py-3 sm:py-5 md:py-6 space-y-3.5 sm:space-y-6 min-w-0"
       }>
         {!user ? (
@@ -1910,6 +2681,7 @@ export default function App() {
           /* TAB 2: Full in-app Calendar View with Schedule, Day, Week, 4-Weeks, Month */
           <div className="w-full h-full min-h-0 overflow-hidden">
             <FullCalendarView
+              initialViewMode={activeWidgetConfig?.calendarViewMode}
               calendars={calendars}
               selectedCalendar={selectedCalendar}
               selectedCalendarIds={selectedCalendarIds}
@@ -1940,10 +2712,13 @@ export default function App() {
               onClearAllTaskLists={handleClearAllCalendarViewTaskLists}
               tasks={tasks}
               onToggleTask={handleToggleTask}
+              onUpdateTask={handleUpdateTask}
+              onDeleteTask={handleDeleteTask}
+              onAddTaskToCalendar={handleAddTaskToCalendar}
               showTaskListsFilter={true}
-              onBackToDashboard={() => handleSelectTab('dashboard')}
               isSidebarOpen={isAppSidebarOpen}
               onCloseSidebar={handleCloseAppSidebar}
+              onToggleSidebar={handleToggleAppSidebar}
             />
           </div>
         ) : currentTab === 'tasks' ? (
@@ -1984,34 +2759,14 @@ export default function App() {
                 localStorage.setItem('travel_tasks_view_tasks_include_no_date', String(val));
               }}
               layoutVariant="sidebar"
-              onBackToDashboard={() => handleSelectTab('dashboard')}
               isSidebarOpen={isAppSidebarOpen}
               onCloseSidebar={handleCloseAppSidebar}
+              onToggleSidebar={handleToggleAppSidebar}
             />
           </div>
         ) : currentTab === 'templates' ? (
           /* TAB 3: Dedicated Task Templates Manager */
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-xl font-bold text-neutral-900 tracking-tight">
-                  Zarządzanie szablonami zadań
-                </h2>
-                <p className="text-xs text-neutral-500 mt-0.5">
-                  Konfiguruj zestawy szablonów dla różnych rodzajów projektów i zadań (Spotkania, Projekty, Rutyny codzienne).
-                </p>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => handleSelectTab('dashboard')}
-                className="inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-neutral-700 bg-white hover:bg-neutral-100 border border-neutral-250 transition cursor-pointer shadow-2xs"
-              >
-                <LayoutDashboard className="w-3.5 h-3.5 text-blue-600" />
-                <span>Powrót do pulpitu</span>
-              </button>
-            </div>
-
             <TemplatesManager
               templates={templates}
               onSaveTemplates={handleSaveTemplates}
@@ -2037,19 +2792,8 @@ export default function App() {
         ) : (
           /* TAB 1: Main Dashboard (Default) */
           <>
-            {/* Top Auto-Sync & Status Bar */}
-            <AutoSyncStatus
-              autoSync={autoSync}
-              onToggleAutoSync={setAutoSync}
-              lastSyncTime={lastSyncTime}
-              onSyncNow={handleRefreshEvents}
-              isSyncing={isSyncing}
-              logs={logs}
-              onClearLogs={() => setLogs([])}
-            />
-
-            {/* Layout Mode Selector for Main Window */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 sm:gap-3 bg-white p-2.5 sm:p-3 rounded-2xl border border-neutral-200/90 shadow-2xs w-full">
+            {/* Layout Mode Selector for Main Window - ukryte w widoku mobile, widoczne na komputerze (sm+) */}
+            <div className="hidden sm:flex sm:flex-row sm:items-center justify-between gap-2.5 sm:gap-3 bg-white p-2.5 sm:p-3 rounded-2xl border border-neutral-200/90 shadow-2xs w-full">
               <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
                 <span className="text-xs font-bold text-neutral-800">Układ głównego okna:</span>
                 <span className="text-xs text-neutral-500 hidden md:inline">
@@ -2131,7 +2875,6 @@ export default function App() {
                   generatingEventId={generatingEventId}
                   generationProgress={generationProgress}
                   onSimulateEvent={handleSimulateEvent}
-                  onDownloadIcs={handleDownloadIcsForTrip}
                   onDeleteEvent={handleDeleteCalendarEvent}
                   onCreateCalendarEvent={handleCreateCalendarEvent}
                   onUpdateCalendarEvent={handleUpdateCalendarEvent}
@@ -2145,6 +2888,9 @@ export default function App() {
                   onReauthorizeCalendar={handleReauthorizeGoogle}
                   dateRange={dashboardCalendarDateRange}
                   onChangeDateRange={setDashboardCalendarDateRange}
+                  tasks={tasks}
+                  showControls={dashboardCalendarControlsOpen}
+                  onToggleControls={() => setDashboardCalendarControlsOpen((p) => !p)}
                 />
               </div>
 
@@ -2184,6 +2930,8 @@ export default function App() {
                     setDashboardTasksIncludeNoDate(val);
                     localStorage.setItem('travel_dashboard_tasks_include_no_date', String(val));
                   }}
+                  showControls={dashboardTasksControlsOpen}
+                  onToggleControls={() => setDashboardTasksControlsOpen((p) => !p)}
                 />
               </div>
             </div>
@@ -2227,6 +2975,52 @@ export default function App() {
           </div>
         </footer>
       )}
+
+      {/* Toast powiadomienia o wyjściu z aplikacji na urządzeniach mobilnych */}
+      {showExitToast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-neutral-900/95 text-white text-xs px-4 py-2.5 rounded-full shadow-2xl border border-neutral-700/60 backdrop-blur-md flex items-center space-x-2 animate-in fade-in slide-in-from-bottom-2 select-none pointer-events-none">
+          <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping" />
+          <span>Naciśnij ponownie, aby wyjść z aplikacji</span>
+        </div>
+      )}
+
+      {/* Modal zarządzania widgetami mobilnymi */}
+      <MobileWidgetsModal
+        isOpen={showWidgetsModal}
+        onClose={() => setShowWidgetsModal(false)}
+        calendars={calendars}
+        taskLists={taskLists}
+        onLaunchWidget={(conf) => {
+          applyWidgetConfig(conf);
+          const url = new URL(window.location.href);
+          url.searchParams.set('widget', conf.id);
+          window.history.replaceState({}, '', url.toString());
+        }}
+      />
+
+      {/* Modal edycji widgetu wywołany z paska trybu widgetu */}
+      {editingWidgetInBar && (
+        <WidgetEditModal
+          isOpen={!!editingWidgetInBar}
+          config={editingWidgetInBar}
+          calendars={calendars}
+          taskLists={taskLists}
+          onClose={() => setEditingWidgetInBar(null)}
+          onSave={(updated) => {
+            saveWidgetConfig(updated);
+            applyWidgetConfig(updated);
+            setEditingWidgetInBar(null);
+          }}
+          onReset={(id) => {
+            const def = resetWidgetConfig(id);
+            applyWidgetConfig(def);
+            setEditingWidgetInBar(def);
+          }}
+        />
+      )}
+
+      {/* Wskaźnik trybu offline */}
+      <OfflineIndicator />
     </div>
   );
 }

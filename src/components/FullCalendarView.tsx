@@ -1,9 +1,10 @@
-import React, { useState, useMemo, useRef, useEffect } from 'react';
+import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import {
   Calendar as CalendarIcon,
   Calendar,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Plus,
   RefreshCw,
   Clock,
@@ -20,10 +21,13 @@ import {
   Eye,
   ListTodo,
   RotateCw,
+  RotateCcw,
+  Check,
   Columns,
   Grid,
   LayoutDashboard,
   MoreHorizontal,
+  ExternalLink,
 } from 'lucide-react';
 import { CalendarListItem, CalendarEventItem, TaskTemplateItem, GoogleTaskList, GoogleTaskItem } from '../types';
 import { expandAllTasksWithRecurrence, isEventRecurring } from '../utils/recurrenceUtils';
@@ -33,17 +37,22 @@ import {
   findPrimaryCalendar,
   isEventLongerThan24hOrAllDay,
   getEventDateSpan,
+  getInclusiveAllDayEndDate,
 } from '../services/googleCalendarApi';
 import { ALL_TASK_LISTS_ID } from '../services/googleTasksApi';
-import { extractTaskTitleAndTime, cleanTaskTitle } from '../services/templateStorage';
+import { extractTaskTitleAndTime, cleanTaskTitle, formatToRfc3339 } from '../services/templateStorage';
 import { ChecklistPopover, ChecklistOption } from './ChecklistPopover';
 import { DateRangeFilterBar } from './DateRangeFilterBar';
+import { AndroidTimePickerField } from './AndroidTimePicker';
 import {
   DateRangeState,
   getDefaultDateRange,
   getCalendarViewDefaultDateRange,
   filterCalendarEvents,
   getTodayDateString,
+  extractLocalDateStr,
+  DATE_PRESET_LABELS,
+  calculatePresetDates,
 } from '../utils/dateFilterUtils';
 import {
   getGoogleEventColor,
@@ -60,6 +69,7 @@ const HOURS_24 = Array.from({ length: 24 }, (_, i) => i);
 export type CalendarViewMode = 'harmonogram' | 'dzien' | 'tydzien' | '4tygodnie' | 'miesiac';
 
 interface FullCalendarViewProps {
+  initialViewMode?: CalendarViewMode;
   calendars: CalendarListItem[];
   selectedCalendar: CalendarListItem | null;
   selectedCalendarIds?: string[];
@@ -112,10 +122,25 @@ interface FullCalendarViewProps {
   onClearAllTaskLists?: () => void;
   tasks?: GoogleTaskItem[];
   onToggleTask?: (task: GoogleTaskItem) => Promise<void>;
+  onUpdateTask?: (
+    taskId: string,
+    updates: Partial<GoogleTaskItem>,
+    targetTaskListId?: string,
+    sourceTaskListId?: string
+  ) => Promise<void>;
+  onDeleteTask?: (task: GoogleTaskItem) => Promise<void>;
+  onAddTaskToCalendar?: (
+    task: GoogleTaskItem,
+    startTime?: string,
+    colorId?: string,
+    targetCalendarIdOverride?: string,
+    isAllDay?: boolean
+  ) => Promise<void>;
   showTaskListsFilter?: boolean;
   onBackToDashboard?: () => void;
   isSidebarOpen?: boolean;
   onCloseSidebar?: () => void;
+  onToggleSidebar?: () => void;
 }
 
 const MONTH_NAMES_PL = [
@@ -151,7 +176,7 @@ const isSameDay = (d1: Date, d2: Date): boolean => {
 
 // Get start of week (Monday)
 const getStartOfWeek = (d: Date): Date => {
-  const res = new Date(d);
+  const res = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12, 0, 0, 0);
   const day = res.getDay();
   const diff = res.getDate() - day + (day === 0 ? -6 : 1);
   res.setDate(diff);
@@ -160,6 +185,7 @@ const getStartOfWeek = (d: Date): Date => {
 };
 
 export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
+  initialViewMode,
   calendars,
   selectedCalendar,
   selectedCalendarIds = [ALL_CALENDARS_ID],
@@ -187,10 +213,14 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
   onClearAllTaskLists,
   tasks = [],
   onToggleTask,
+  onUpdateTask,
+  onDeleteTask,
+  onAddTaskToCalendar,
   showTaskListsFilter = false,
   onBackToDashboard,
   isSidebarOpen = false,
   onCloseSidebar,
+  onToggleSidebar,
 }) => {
   const checklistCalendarOptions: ChecklistOption[] = useMemo(() => {
     return calendars
@@ -219,21 +249,46 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
         color: '#a79b8e',
       }));
   }, [taskLists]);
-  // Current view mode (default: month view)
+  // Current view mode (default: month view or initialViewMode)
   const [viewMode, setViewMode] = useState<CalendarViewMode>(() => {
+    if (initialViewMode && ['harmonogram', 'dzien', 'tydzien', '4tygodnie', 'miesiac'].includes(initialViewMode)) {
+      return initialViewMode;
+    }
     const saved = localStorage.getItem('travel_calendar_view_mode') as CalendarViewMode;
     return saved && ['harmonogram', 'dzien', 'tydzien', '4tygodnie', 'miesiac'].includes(saved)
       ? saved
       : 'miesiac';
   });
 
+  useEffect(() => {
+    if (initialViewMode && ['harmonogram', 'dzien', 'tydzien', '4tygodnie', 'miesiac'].includes(initialViewMode)) {
+      setViewMode(initialViewMode);
+    }
+  }, [initialViewMode]);
+
   const handleSelectViewMode = (mode: CalendarViewMode) => {
     setViewMode(mode);
     localStorage.setItem('travel_calendar_view_mode', mode);
+    // W karcie kalendarz:
+    // dla widoku harmonogram wyświetlaj domyślnie zakres dat Od dzisiaj
+    // dla pozostałych widoków wyświetlaj zakres dat wszystkie
+    // stosuj te ustawienia domyślnie i przy ręcznej zmianie widoku kalendarza
+    const targetRange = mode === 'harmonogram' ? getDefaultDateRange() : getCalendarViewDefaultDateRange();
+    handleDateRangeChange(targetRange);
   };
 
   // Cursor date for navigation
   const [cursorDate, setCursorDate] = useState<Date>(() => new Date());
+
+  // Selected day in Month and 4-Weeks view (single-click day selection)
+  const [selectedMonthDateStr, setSelectedMonthDateStr] = useState<string>(() => toDateString(new Date()));
+  const lastTapRef = useRef<{ dateStr: string; time: number }>({ dateStr: '', time: 0 });
+  const lastDoubleActionTimeRef = useRef<number>(0);
+
+  const handleSelectMonthDay = useCallback((date: Date, dateStr: string) => {
+    setSelectedMonthDateStr(dateStr);
+    setCursorDate(date);
+  }, []);
 
   // Filter: 'all' | 'events' | 'tasks' (persisted in localStorage)
   const [filterType, setFilterType] = useState<'all' | 'events' | 'tasks'>(() => {
@@ -248,9 +303,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     localStorage.setItem('travel_calendar_filter_type', type);
   };
 
-  // Date range filter state (defaults to 'all' = all dates in full calendar view)
+  // Date range filter state (defaults: harmonogram -> 'from_today', others -> 'all')
   const [internalDateRange, setInternalDateRange] = useState<DateRangeState>(() => {
-    return getCalendarViewDefaultDateRange();
+    const savedMode = localStorage.getItem('travel_calendar_view_mode');
+    return savedMode === 'harmonogram' ? getDefaultDateRange() : getCalendarViewDefaultDateRange();
   });
 
   const activeDateRange = propDateRange || internalDateRange;
@@ -264,13 +320,38 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     }
   };
 
+  // Ensure default date ranges apply on initial mount if not yet aligned
+  const isInitialMountRef = useRef(true);
+  useEffect(() => {
+    if (isInitialMountRef.current) {
+      isInitialMountRef.current = false;
+      const expectedPreset = viewMode === 'harmonogram' ? 'from_today' : 'all';
+      if (activeDateRange.preset !== expectedPreset) {
+        const targetRange = viewMode === 'harmonogram' ? getDefaultDateRange() : getCalendarViewDefaultDateRange();
+        handleDateRangeChange(targetRange);
+      }
+    }
+  }, [viewMode, activeDateRange.preset]);
+
+  // Helper to check if task event is completed
+  const isTaskCompleted = (ev: CalendarEventItem): boolean => {
+    if (ev.taskStatus) return ev.taskStatus === 'completed';
+    if (ev.description?.includes('Status: Ukończone')) return true;
+    if (ev.id.startsWith('gtask-')) {
+      const realId = ev.id.replace('gtask-', '');
+      const matched = tasks.find((t) => t.id === realId);
+      if (matched) return matched.status === 'completed';
+    }
+    return false;
+  };
+
   // Event modal state (Add / Edit)
   const [showEventModal, setShowEventModal] = useState(false);
   const [editingEvent, setEditingEvent] = useState<CalendarEventItem | null>(null);
   const [eventSummary, setEventSummary] = useState('');
   const [eventCalendarId, setEventCalendarId] = useState<string>('');
-  const [eventStartDate, setEventStartDate] = useState('');
-  const [eventEndDate, setEventEndDate] = useState('');
+  const [eventStartDate, setEventStartDate] = useState(() => toDateString(new Date()));
+  const [eventEndDate, setEventEndDate] = useState(() => toDateString(new Date()));
   const [eventStartTime, setEventStartTime] = useState('09:00');
   const [eventEndTime, setEventEndTime] = useState('09:30');
   const [eventIsAllDay, setEventIsAllDay] = useState(true);
@@ -287,6 +368,114 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
   const [eventToDelete, setEventToDelete] = useState<CalendarEventItem | null>(null);
   const [isDeletingEvent, setIsDeletingEvent] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Editing task state from calendar
+  const [editingTask, setEditingTask] = useState<GoogleTaskItem | null>(null);
+  const [editTaskTitle, setEditTaskTitle] = useState('');
+  const [editTaskDue, setEditTaskDue] = useState('');
+  const [editTaskTime, setEditTaskTime] = useState('18:00');
+  const [editTaskHasTime, setEditTaskHasTime] = useState(false);
+  const [editTaskNotes, setEditTaskNotes] = useState('');
+  const [editTaskTargetListId, setEditTaskTargetListId] = useState('');
+  const [editTaskAlsoCalendar, setEditTaskAlsoCalendar] = useState(false);
+  const [editTaskTargetCalendarId, setEditTaskTargetCalendarId] = useState('');
+  const [editTaskColorId, setEditTaskColorId] = useState('');
+  const [isSavingTaskEdit, setIsSavingTaskEdit] = useState(false);
+
+  const handleOpenEditTaskFromCalendar = (task: GoogleTaskItem) => {
+    setEditingTask(task);
+    setEditTaskTitle(cleanTaskTitle(task.title));
+    const extractedDue = extractLocalDateStr(task.due);
+    setEditTaskDue(extractedDue || '');
+    const { time } = extractTaskTitleAndTime(task.title, task.notes, templates, task.due);
+    if (time) {
+      setEditTaskTime(time);
+      setEditTaskHasTime(true);
+    } else {
+      setEditTaskTime('18:00');
+      setEditTaskHasTime(false);
+    }
+    const cleanNotes = (task.notes || '')
+      .replace(/(?:⏰\s*)?Godzina(?:\s*wykonania|\s*rozpoczęcia)?:\s*\d{1,2}:\d{2}\s*/gi, '')
+      .trim();
+    setEditTaskNotes(cleanNotes);
+    setEditTaskTargetListId(task.taskListId || (taskLists[0]?.id !== ALL_TASK_LISTS_ID ? taskLists[0]?.id : ''));
+    setEditTaskAlsoCalendar(false);
+    const primaryCal = findPrimaryCalendar(calendars);
+    setEditTaskTargetCalendarId(
+      selectedCalendar && selectedCalendar.id !== ALL_CALENDARS_ID
+        ? selectedCalendar.id
+        : primaryCal?.id || 'primary'
+    );
+    const matchedColor = templateColorMap.get(cleanTaskTitle(task.title).toLowerCase());
+    setEditTaskColorId(matchedColor || '');
+  };
+
+  const handleSaveEditTaskFromCalendar = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTask || !editTaskTitle.trim() || !onUpdateTask) return;
+
+    try {
+      setIsSavingTaskEdit(true);
+      const clean = cleanTaskTitle(editTaskTitle.trim());
+
+      let taskHour = '';
+      if (editTaskHasTime && editTaskTime && /^(\d{1,2}):(\d{2})$/.test(editTaskTime)) {
+        taskHour = editTaskTime;
+      }
+
+      let rfcDue = '';
+      if (editTaskDue) {
+        const [year, month, day] = editTaskDue.split('-').map(Number);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        if (taskHour) {
+          let [h, m] = taskHour.split(':').map(Number);
+          if (isNaN(h)) h = 18;
+          if (isNaN(m)) m = 0;
+          const target = new Date(year, month - 1, day, h, m, 0, 0);
+          rfcDue = formatToRfc3339(target);
+        } else {
+          rfcDue = `${year}-${pad(month)}-${pad(day)}T00:00:00.000Z`;
+        }
+      }
+
+      let updatedNotes = editTaskNotes
+        .replace(/(?:⏰\s*)?Godzina(?:\s*wykonania|\s*rozpoczęcia)?:\s*\d{1,2}:\d{2}\s*/gi, '')
+        .trim();
+
+      if (taskHour) {
+        updatedNotes = updatedNotes
+          ? `${updatedNotes}\n⏰ Godzina rozpoczęcia: ${taskHour}`
+          : `⏰ Godzina rozpoczęcia: ${taskHour}`;
+      }
+
+      await onUpdateTask(
+        editingTask.id,
+        {
+          title: clean,
+          due: rfcDue,
+          notes: updatedNotes || undefined,
+        },
+        editTaskTargetListId || undefined,
+        editingTask.taskListId
+      );
+
+      if (editTaskAlsoCalendar && onAddTaskToCalendar && editTaskDue) {
+        await onAddTaskToCalendar(
+          { ...editingTask, title: clean, due: rfcDue, notes: updatedNotes },
+          taskHour || '18:00',
+          editTaskColorId || undefined,
+          editTaskTargetCalendarId || undefined
+        );
+      }
+
+      setEditingTask(null);
+    } catch (err: any) {
+      console.error('Błąd zapisu zadania z kalendarza:', err);
+    } finally {
+      setIsSavingTaskEdit(false);
+    }
+  };
 
   const handleStartTimeChange = (newStartTime: string) => {
     setEventStartTime(newStartTime);
@@ -326,48 +515,326 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     setCursorDate(new Date());
   };
 
-  const handlePrev = () => {
-    const next = new Date(cursorDate);
-    if (viewMode === 'dzien') {
-      next.setDate(next.getDate() - 1);
-    } else if (viewMode === 'tydzien') {
-      next.setDate(next.getDate() - 7);
-    } else if (viewMode === '4tygodnie') {
-      next.setDate(next.getDate() - 28);
-    } else {
-      // Month & Harmonogram
-      next.setMonth(next.getMonth() - 1);
-    }
-    setCursorDate(next);
-  };
+  const cursorDateRef = useRef(cursorDate);
+  cursorDateRef.current = cursorDate;
+  const viewModeRef = useRef(viewMode);
+  viewModeRef.current = viewMode;
 
-  const handleNext = () => {
-    const next = new Date(cursorDate);
-    if (viewMode === 'dzien') {
-      next.setDate(next.getDate() + 1);
-    } else if (viewMode === 'tydzien') {
-      next.setDate(next.getDate() + 7);
-    } else if (viewMode === '4tygodnie') {
-      next.setDate(next.getDate() + 28);
-    } else {
-      // Month & Harmonogram
-      next.setMonth(next.getMonth() + 1);
-    }
-    setCursorDate(next);
-  };
+  const navigatePeriod = useCallback((direction: 1 | -1) => {
+    setCursorDate((prev) => {
+      const next = new Date(prev);
+      const mode = viewModeRef.current;
+      if (mode === 'dzien') {
+        next.setDate(next.getDate() + direction * 1);
+      } else if (mode === 'tydzien') {
+        next.setDate(next.getDate() + direction * 7);
+      } else if (mode === '4tygodnie') {
+        next.setDate(next.getDate() + direction * 28);
+      } else {
+        // Month & Harmonogram
+        next.setMonth(next.getMonth() + direction * 1);
+      }
+      return next;
+    });
+  }, []);
 
+  const handlePrev = useCallback(() => {
+    navigatePeriod(-1);
+  }, [navigatePeriod]);
+
+  const handleNext = useCallback(() => {
+    navigatePeriod(1);
+  }, [navigatePeriod]);
+
+  const calendarBodyRef = useRef<HTMLDivElement>(null);
+  const wheelAccumulatorRef = useRef<number>(0);
+  const lastWheelNavTimeRef = useRef<number>(0);
+
+  // Mouse wheel listener for 'miesiac' and '4tygodnie' views (przewijanie kalendarza kółkiem myszy bez klikania)
+  useEffect(() => {
+    const el = calendarBodyRef.current;
+    if (!el) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      const currentMode = viewModeRef.current;
+      if (currentMode !== 'miesiac' && currentMode !== '4tygodnie') return;
+
+      // Allow natural scrolling inside day cells if they contain an overflowing event list
+      const target = e.target as HTMLElement | null;
+      const scrollableList = target?.closest('.day-cell-scrollbar') as HTMLElement | null;
+      if (scrollableList && scrollableList.scrollHeight > scrollableList.clientHeight) {
+        const isScrollingDown = e.deltaY > 0;
+        const isScrollingUp = e.deltaY < 0;
+        const canScrollDown = Math.ceil(scrollableList.scrollTop + scrollableList.clientHeight) < scrollableList.scrollHeight - 2;
+        const canScrollUp = scrollableList.scrollTop > 2;
+
+        if ((isScrollingDown && canScrollDown) || (isScrollingUp && canScrollUp)) {
+          return;
+        }
+      }
+
+      // Prevent window/page outer scrolling while navigating calendar periods
+      e.preventDefault();
+
+      const now = Date.now();
+      if (now < lastWheelNavTimeRef.current) {
+        return;
+      }
+
+      const delta = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+      if (Math.abs(delta) < 2) return;
+
+      // Reset accumulator if user stopped scrolling for > 350ms
+      if (now - lastWheelNavTimeRef.current > 350) {
+        wheelAccumulatorRef.current = 0;
+      }
+
+      wheelAccumulatorRef.current += delta;
+
+      const THRESHOLD = 45;
+      if (wheelAccumulatorRef.current >= THRESHOLD) {
+        navigatePeriod(1);
+        wheelAccumulatorRef.current = 0;
+        lastWheelNavTimeRef.current = now + 260;
+      } else if (wheelAccumulatorRef.current <= -THRESHOLD) {
+        navigatePeriod(-1);
+        wheelAccumulatorRef.current = 0;
+        lastWheelNavTimeRef.current = now + 260;
+      }
+    };
+
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', handleWheel);
+    };
+  }, [navigatePeriod]);
+
+  const [timelineViewportHeight, setTimelineViewportHeight] = useState<number>(0);
   const weekScrollRef = useRef<HTMLDivElement>(null);
   const dayScrollRef = useRef<HTMLDivElement>(null);
 
+  // ResizeObserver for Day and Week timeline containers to calculate exact hour height for 6:00 to 22:00
   useEffect(() => {
-    if ((viewMode === 'tydzien' || viewMode === 'dzien') && (weekScrollRef.current || dayScrollRef.current)) {
-      const nowHour = new Date().getHours();
-      const initialHour = Math.max(0, Math.min(nowHour > 6 ? nowHour - 1 : 7, 18));
-      const targetScroll = initialHour * 48;
-      if (weekScrollRef.current) weekScrollRef.current.scrollTop = targetScroll;
-      if (dayScrollRef.current) dayScrollRef.current.scrollTop = targetScroll;
+    const el = viewMode === 'tydzien' ? weekScrollRef.current : viewMode === 'dzien' ? dayScrollRef.current : null;
+    if (!el) return;
+    const updateSize = () => {
+      if (el.clientHeight > 0) {
+        setTimelineViewportHeight(el.clientHeight);
+      }
+    };
+    updateSize();
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.contentRect.height > 0) {
+          setTimelineViewportHeight(entry.contentRect.height);
+        }
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [viewMode]);
+
+  // Height of 1 hour in Day and Week views:
+  // Reduced by 20% to fit more hours in the visible height (fits ~20 hours)
+  const hourHeight = useMemo(() => {
+    if (timelineViewportHeight > 0) {
+      return Math.max(26, Math.floor((timelineViewportHeight / 16) * 0.8));
     }
-  }, [viewMode, cursorDate]);
+    return 38;
+  }, [timelineViewportHeight]);
+
+  // Default scroll to 6:00 (so 6:00 to 22:00 is displayed)
+  useEffect(() => {
+    if (viewMode === 'tydzien' || viewMode === 'dzien') {
+      const targetScroll = 6 * hourHeight;
+      const applyScroll = () => {
+        if (weekScrollRef.current) weekScrollRef.current.scrollTop = targetScroll;
+        if (dayScrollRef.current) dayScrollRef.current.scrollTop = targetScroll;
+      };
+      applyScroll();
+      const timer = setTimeout(applyScroll, 40);
+      return () => clearTimeout(timer);
+    }
+  }, [viewMode, cursorDate, hourHeight]);
+
+  // Month view container measurement and row height calculation:
+  // Displays the first 4 weeks on the device screen; subsequent weeks (5th / 6th) are visible after scrolling
+  const monthScrollRef = useRef<HTMLDivElement>(null);
+  const [monthViewportHeight, setMonthViewportHeight] = useState<number>(0);
+
+  useEffect(() => {
+    if (viewMode !== 'miesiac' || !monthScrollRef.current) return;
+    const el = monthScrollRef.current;
+    const updateSize = () => {
+      if (el.clientHeight > 0) {
+        setMonthViewportHeight(el.clientHeight);
+      }
+    };
+    updateSize();
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.contentRect.height > 0) {
+          setMonthViewportHeight(entry.contentRect.height);
+        }
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [viewMode]);
+
+
+
+  // Calendar controls dropdown menu ('...' button to the left of 'Dzisiaj')
+  const [showCalendarControlsMenu, setShowCalendarControlsMenu] = useState(false);
+  const calendarControlsDropdownRef = useRef<HTMLDivElement>(null);
+  const mobileCalendarControlsDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node;
+      const insideDesktop = calendarControlsDropdownRef.current && calendarControlsDropdownRef.current.contains(target);
+      const insideMobile = mobileCalendarControlsDropdownRef.current && mobileCalendarControlsDropdownRef.current.contains(target);
+      if (!insideDesktop && !insideMobile) {
+        setShowCalendarControlsMenu(false);
+      }
+    };
+    if (showCalendarControlsMenu) {
+      document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('touchstart', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('touchstart', handleClickOutside);
+    };
+  }, [showCalendarControlsMenu]);
+
+  // Swipe / Drag sideways on calendar to navigate date periods
+  const [dragOffset, setDragOffset] = useState<number>(0);
+  const [isSwiping, setIsSwiping] = useState<boolean>(false);
+  const didDragRef = useRef<boolean>(false);
+  const touchStartRef = useRef<{ x: number; y: number; time: number; isHorizontal: boolean | null } | null>(null);
+  const mouseStartRef = useRef<{ x: number; y: number; time: number; isDragging: boolean } | null>(null);
+
+  // Prevent accidental clicks after dragging
+  useEffect(() => {
+    const handleCaptureClick = (e: MouseEvent) => {
+      if (didDragRef.current) {
+        e.stopPropagation();
+        e.preventDefault();
+        didDragRef.current = false;
+      }
+    };
+    window.addEventListener('click', handleCaptureClick, true);
+    return () => window.removeEventListener('click', handleCaptureClick, true);
+  }, []);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const touch = e.touches[0];
+    didDragRef.current = false;
+    touchStartRef.current = {
+      x: touch.clientX,
+      y: touch.clientY,
+      time: Date.now(),
+      isHorizontal: null,
+    };
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (!touchStartRef.current || e.touches.length !== 1) return;
+    const touch = e.touches[0];
+    const dx = touch.clientX - touchStartRef.current.x;
+    const dy = touch.clientY - touchStartRef.current.y;
+
+    if (touchStartRef.current.isHorizontal === null) {
+      if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+        if (Math.abs(dx) > Math.abs(dy) * 1.3) {
+          touchStartRef.current.isHorizontal = true;
+          didDragRef.current = true;
+          setIsSwiping(true);
+        } else {
+          touchStartRef.current.isHorizontal = false;
+        }
+      }
+    }
+
+    if (touchStartRef.current.isHorizontal) {
+      setDragOffset(dx * 0.6);
+    }
+  };
+
+  const handleTouchEnd = () => {
+    if (touchStartRef.current?.isHorizontal && isSwiping) {
+      didDragRef.current = true;
+      if (dragOffset > 50) {
+        handlePrev();
+      } else if (dragOffset < -50) {
+        handleNext();
+      }
+    }
+    setDragOffset(0);
+    setIsSwiping(false);
+    touchStartRef.current = null;
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    // Don't drag if clicking buttons, inputs, links, or close buttons
+    if (target.closest('button, input, select, textarea, a, [role="button"], [role="option"], .no-drag')) {
+      return;
+    }
+    didDragRef.current = false;
+    mouseStartRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      time: Date.now(),
+      isDragging: false,
+    };
+  };
+
+  useEffect(() => {
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      if (!mouseStartRef.current) return;
+      const dx = e.clientX - mouseStartRef.current.x;
+      const dy = e.clientY - mouseStartRef.current.y;
+
+      if (!mouseStartRef.current.isDragging) {
+        if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+          mouseStartRef.current.isDragging = true;
+          didDragRef.current = true;
+          setIsSwiping(true);
+        }
+      }
+
+      if (mouseStartRef.current.isDragging) {
+        setDragOffset(dx * 0.6);
+      }
+    };
+
+    const handleGlobalMouseUp = () => {
+      if (mouseStartRef.current) {
+        if (mouseStartRef.current.isDragging) {
+          didDragRef.current = true;
+          if (dragOffset > 50) {
+            handlePrev();
+          } else if (dragOffset < -50) {
+            handleNext();
+          }
+        }
+        setDragOffset(0);
+        setIsSwiping(false);
+        mouseStartRef.current = null;
+      }
+    };
+
+    window.addEventListener('mousemove', handleGlobalMouseMove);
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleGlobalMouseMove);
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [dragOffset, cursorDate, viewMode]);
 
   // Open modal to add event
   const handleOpenAddEvent = (presetDate?: string, presetTime?: string) => {
@@ -379,7 +846,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
         ? selectedCalendar.id
         : primaryCal?.id || 'primary';
     setEventCalendarId(defaultCalId);
-    const d = presetDate || toDateString(cursorDate);
+    const d = presetDate || (viewMode === 'miesiac' && selectedMonthDateStr ? selectedMonthDateStr : toDateString(cursorDate));
     setEventStartDate(d);
     setEventEndDate(d);
     if (presetTime) {
@@ -403,6 +870,26 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     setShowEventModal(true);
   };
 
+  // Keyboard shortcut listeners (d, w, x, m, n)
+  useEffect(() => {
+    const handleSwitchCalendarView = (e: Event) => {
+      const customEvent = e as CustomEvent<{ mode: CalendarViewMode }>;
+      if (customEvent.detail?.mode) {
+        handleSelectViewMode(customEvent.detail.mode);
+      }
+    };
+    const handleTriggerNewEvent = () => {
+      handleOpenAddEvent(selectedMonthDateStr || toDateString(cursorDate));
+    };
+
+    window.addEventListener('app:switch-calendar-view', handleSwitchCalendarView);
+    window.addEventListener('app:open-new-event', handleTriggerNewEvent);
+    return () => {
+      window.removeEventListener('app:switch-calendar-view', handleSwitchCalendarView);
+      window.removeEventListener('app:open-new-event', handleTriggerNewEvent);
+    };
+  }, [handleOpenAddEvent, handleSelectViewMode, selectedMonthDateStr, cursorDate]);
+
   // Open modal to edit event
   const handleOpenEditEvent = (event: CalendarEventItem) => {
     setEditingEvent(event);
@@ -425,8 +912,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
       setEventStartTime(`${pad(s.getHours())}:${pad(s.getMinutes())}`);
       setEventEndTime(`${pad(e.getHours())}:${pad(e.getMinutes())}`);
     } else {
-      setEventStartDate(event.start.date || toDateString(new Date()));
-      setEventEndDate(event.end?.date || event.start.date || toDateString(new Date()));
+      const sDate = event.start.date || toDateString(new Date());
+      setEventStartDate(sDate);
+      setEventEndDate(getInclusiveAllDayEndDate(sDate, event.end?.date));
       setEventStartTime('09:00');
       setEventEndTime('09:30');
     }
@@ -438,10 +926,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     setShowEventModal(true);
   };
 
-  // Open modal to duplicate event (pre-fills copy and saves as new event)
+  // Open modal to duplicate event (pre-fills copy and saves as new event without '(Kopia)')
   const handleDuplicateEvent = (event: CalendarEventItem) => {
     setEditingEvent(null);
-    setEventSummary(`${event.summary || 'Wydarzenie'} (Kopia)`);
+    setEventSummary(event.summary || 'Wydarzenie');
     const currentCalId =
       event.calendarId ||
       (selectedCalendar && selectedCalendar.id !== ALL_CALENDARS_ID
@@ -460,8 +948,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
       setEventStartTime(`${pad(s.getHours())}:${pad(s.getMinutes())}`);
       setEventEndTime(`${pad(e.getHours())}:${pad(e.getMinutes())}`);
     } else {
-      setEventStartDate(event.start.date || toDateString(new Date()));
-      setEventEndDate(event.end?.date || event.start.date || toDateString(new Date()));
+      const sDate = event.start.date || toDateString(new Date());
+      setEventStartDate(sDate);
+      setEventEndDate(getInclusiveAllDayEndDate(sDate, event.end?.date));
       setEventStartTime('09:00');
       setEventEndTime('09:30');
     }
@@ -663,8 +1152,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     const resultEvents: CalendarEventItem[] = [];
 
     expandedOccurrences.forEach((t) => {
-      const { time, cleanTitle } = extractTaskTitleAndTime(t.title, t.notes, templates);
-      const currentDueStr = t.due ? (t.due.includes('T') ? t.due.split('T')[0] : t.due) : '';
+      const { time, cleanTitle } = extractTaskTitleAndTime(t.title, t.notes, templates, t.due);
+      const currentDueStr = extractLocalDateStr(t.due);
       if (!currentDueStr) return;
 
       let start: { dateTime?: string; date?: string } = {};
@@ -698,6 +1187,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
         calendarSummary: t.taskListTitle ? `Lista: ${t.taskListTitle}` : 'Google Tasks',
         colorId: matchedColorId || 'birch',
         recurringEventId: t.isRecurringOccurrence ? (t.originalTaskId || t.id) : undefined,
+        taskStatus: t.status,
       });
     });
 
@@ -732,17 +1222,18 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     return raw ? new Date(raw) : new Date();
   };
 
-  // Helper to format event time
-  const formatEventTime = (ev: CalendarEventItem): string => {
-    if (isEventLongerThan24hOrAllDay(ev) || !ev.start.dateTime) return 'Cały dzień';
+  // Helper to format event start time (only start time, no end time)
+  const formatEventStartTime = (ev: CalendarEventItem): string => {
+    if (isEventLongerThan24hOrAllDay(ev) || !ev.start.dateTime) return '';
     const s = new Date(ev.start.dateTime);
     const pad = (n: number) => String(n).padStart(2, '0');
-    let res = `${pad(s.getHours())}:${pad(s.getMinutes())}`;
-    if (ev.end?.dateTime) {
-      const e = new Date(ev.end.dateTime);
-      res += ` – ${pad(e.getHours())}:${pad(e.getMinutes())}`;
-    }
-    return res;
+    return `${pad(s.getHours())}:${pad(s.getMinutes())}`;
+  };
+
+  // Helper to format event time (shows start time only, no end time)
+  const formatEventTime = (ev: CalendarEventItem): string => {
+    if (isEventLongerThan24hOrAllDay(ev) || !ev.start.dateTime) return 'Cały dzień';
+    return formatEventStartTime(ev);
   };
 
   // Title for current header based on viewMode
@@ -812,6 +1303,18 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     return days;
   }, [cursorDate]);
 
+  const totalMonthWeeks = useMemo(() => {
+    return Math.ceil(monthGridDays.length / 7);
+  }, [monthGridDays.length]);
+
+  const monthWeekRowHeight = useMemo(() => {
+    if (monthViewportHeight > 0) {
+      // Fit 4 weeks in the visible viewport (accounting for gap between rows: 3 gaps * 4px = 12px)
+      return Math.max(90, Math.floor((monthViewportHeight - 12) / 4));
+    }
+    return null;
+  }, [monthViewportHeight]);
+
   // Render 4 Weeks View Data
   const fourWeeksDays = useMemo(() => {
     const start = getStartOfWeek(cursorDate);
@@ -869,8 +1372,379 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
   const todayStr = toDateString(new Date());
 
+
+
+  // Render Calendar Controls dropdown menu ('...' button to the left of 'Dzisiaj')
+  const renderCalendarControlsMenuContent = () => (
+    <div className="space-y-3 max-h-[75vh] overflow-y-auto pr-1 text-left select-none">
+      {/* Header */}
+      <div className="flex items-center justify-between pb-2 border-b border-neutral-200">
+        <div className="flex items-center space-x-2">
+          <div className="w-6 h-6 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
+            <Calendar className="w-3.5 h-3.5" />
+          </div>
+          <div>
+            <h3 className="text-xs font-bold text-neutral-900">Sterowanie kalendarzem</h3>
+            <span className="text-[10px] text-neutral-500 block">Opcje widoku, filtrów i kalendarzy</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowCalendarControlsMenu(false)}
+          className="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-colors cursor-pointer"
+          title="Zamknij"
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* 1. Szybkie akcje (Nowe wydarzenie, Odśwież) */}
+      <div className="space-y-1.5">
+        <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider block">
+          Akcje
+        </span>
+        <div className="grid grid-cols-2 gap-1.5">
+          {onCreateCalendarEvent && (
+            <button
+              type="button"
+              id="btn-cal-menu-create-event"
+              onClick={() => {
+                setShowCalendarControlsMenu(false);
+                handleOpenAddEvent(selectedMonthDateStr || toDateString(cursorDate));
+              }}
+              className="w-full inline-flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-xs font-semibold shadow-2xs transition-colors cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>+ Nowe</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            id="btn-cal-menu-refresh"
+            onClick={() => {
+              onRefreshEvents();
+            }}
+            disabled={isLoadingEvents}
+            className="w-full inline-flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-white hover:bg-neutral-50 active:bg-neutral-100 text-neutral-700 border border-neutral-250 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoadingEvents ? 'animate-spin text-blue-600' : 'text-neutral-600'}`} />
+            <span>{isLoadingEvents ? 'Odświeżanie...' : 'Odśwież'}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* 2. Tryby widoku kalendarza */}
+      <div className="space-y-1.5">
+        <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider block">
+          Widok kalendarza
+        </span>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-1 bg-neutral-100 p-1 rounded-xl border border-neutral-200">
+          {(
+            [
+              { id: 'dzien', label: 'Dzień' },
+              { id: 'tydzien', label: 'Tydzień' },
+              { id: '4tygodnie', label: '4 tyg.' },
+              { id: 'miesiac', label: 'Miesiąc' },
+              { id: 'harmonogram', label: 'Harmonogram' },
+            ] as const
+          ).map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => {
+                handleSelectViewMode(m.id);
+              }}
+              className={`px-2 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer text-center ${
+                viewMode === m.id
+                  ? 'bg-white text-blue-700 font-bold shadow-2xs border border-neutral-200/80'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-white/50'
+              }`}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 3. Kalendarze Google (lista z checkboxami) */}
+      {calendars.length > 0 && onToggleCalendarId && (
+        <div className="space-y-1.5 p-2 bg-neutral-50/70 rounded-xl border border-neutral-200">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-bold text-neutral-800 uppercase tracking-wider">
+              Kalendarze ({calendars.length})
+            </span>
+            {onSelectAllCalendars && onClearAllCalendars && (
+              <div className="space-x-1.5 text-[10px]">
+                <button
+                  type="button"
+                  onClick={onSelectAllCalendars}
+                  className="text-blue-600 hover:underline cursor-pointer font-medium"
+                >
+                  Wszystkie
+                </button>
+                <span className="text-neutral-300">•</span>
+                <button
+                  type="button"
+                  onClick={onClearAllCalendars}
+                  className="text-neutral-500 hover:underline cursor-pointer"
+                >
+                  Wyczyść
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+            {calendars.map((cal) => {
+              const isChecked =
+                selectedCalendarIds.includes(ALL_CALENDARS_ID) ||
+                selectedCalendarIds.includes(cal.id);
+              return (
+                <label
+                  key={cal.id}
+                  className="flex items-center space-x-2 text-xs text-neutral-700 hover:text-neutral-900 cursor-pointer py-0.5 select-none"
+                >
+                  <input
+                    type="checkbox"
+                    checked={isChecked}
+                    onChange={() => onToggleCalendarId(cal.id)}
+                    className="rounded text-blue-600 focus:ring-blue-500 w-3.5 h-3.5 cursor-pointer shrink-0"
+                  />
+                  <span
+                    className="w-2.5 h-2.5 rounded-full shrink-0"
+                    style={{ backgroundColor: cal.backgroundColor || '#3b82f6' }}
+                  />
+                  <span className="truncate text-[11px]" title={cal.summary}>
+                    {cal.summary}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* 4. Listy zadań w kalendarzu (lista z checkboxami) */}
+      {(showTaskListsFilter || (taskLists && taskLists.length > 0)) &&
+        taskLists.length > 0 &&
+        onToggleTaskListId && (
+          <div className="space-y-1.5 p-2 bg-neutral-50/70 rounded-xl border border-neutral-200">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold text-neutral-800 uppercase tracking-wider">
+                Listy zadań ({taskLists.length})
+              </span>
+              {onSelectAllTaskLists && onClearAllTaskLists && (
+                <div className="space-x-1.5 text-[10px]">
+                  <button
+                    type="button"
+                    onClick={onSelectAllTaskLists}
+                    className="text-emerald-600 hover:underline cursor-pointer font-medium"
+                  >
+                    Wszystkie
+                  </button>
+                  <span className="text-neutral-300">•</span>
+                  <button
+                    type="button"
+                    onClick={onClearAllTaskLists}
+                    className="text-neutral-500 hover:underline cursor-pointer"
+                  >
+                    Wyczyść
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+              {taskLists.map((tl) => {
+                const isChecked =
+                  !selectedTaskListIds ||
+                  selectedTaskListIds.length === 0 ||
+                  selectedTaskListIds.includes(ALL_TASK_LISTS_ID) ||
+                  selectedTaskListIds.includes(tl.id);
+                return (
+                  <label
+                    key={tl.id}
+                    className="flex items-center space-x-2 text-xs text-neutral-700 hover:text-neutral-900 cursor-pointer py-0.5 select-none"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={isChecked}
+                      onChange={() => onToggleTaskListId(tl.id)}
+                      className="rounded text-emerald-600 focus:ring-emerald-500 w-3.5 h-3.5 cursor-pointer shrink-0"
+                    />
+                    <span className="truncate text-[11px]" title={tl.title}>
+                      {tl.title}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+      {/* 5. Filtry zawartości (Elementy w kalendarzu przesunięte na dół powyżej linka do Google Calendar) */}
+      <div className="space-y-1.5">
+        <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider block">
+          Elementy w kalendarzu
+        </span>
+        <div className="grid grid-cols-3 gap-1 bg-neutral-100 p-1 rounded-xl border border-neutral-200">
+          {(
+            [
+              { id: 'all', label: 'Wszystkie' },
+              { id: 'events', label: 'Wydarzenia' },
+              { id: 'tasks', label: 'Zadania' },
+            ] as const
+          ).map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              onClick={() => handleSelectFilterType(f.id)}
+              className={`px-2 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer text-center ${
+                filterType === f.id
+                  ? 'bg-neutral-800 text-white font-semibold shadow-2xs'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-white/50'
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 6. Wybór zakresu dat */}
+      <div className="space-y-1.5 p-2 bg-neutral-50/70 rounded-xl border border-neutral-200">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-1.5">
+            <span className="text-[10px] font-bold text-neutral-800 uppercase tracking-wider block">
+              Zakres dat
+            </span>
+            <span className="text-[10px] font-semibold text-blue-700">
+              ({DATE_PRESET_LABELS[activeDateRange.preset] || activeDateRange.preset})
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              const target = viewMode === 'harmonogram' ? getDefaultDateRange() : getCalendarViewDefaultDateRange();
+              handleDateRangeChange(target);
+            }}
+            className="text-[10px] text-blue-600 hover:text-blue-800 font-semibold cursor-pointer flex items-center space-x-1"
+            title="Przywróć domyślny zakres dla tego widoku"
+          >
+            <RotateCcw className="w-2.5 h-2.5" />
+            <span>Domyślny</span>
+          </button>
+        </div>
+        <div className="grid grid-cols-3 sm:grid-cols-4 gap-1 text-[11px]">
+          {(
+            [
+              { preset: 'all', label: 'Wszystkie' },
+              { preset: 'today', label: 'Dzisiaj' },
+              { preset: 'from_today', label: 'Od dzisiaj' },
+              { preset: 'next_7_days', label: '7 dni' },
+              { preset: 'next_30_days', label: '30 dni' },
+              { preset: 'this_month', label: 'Miesiąc' },
+              { preset: 'custom', label: 'Własny' },
+            ] as const
+          ).map((p) => {
+            const isSelected = activeDateRange.preset === p.preset;
+            return (
+              <button
+                key={p.preset}
+                type="button"
+                onClick={() => {
+                  if (p.preset === 'custom') {
+                    handleDateRangeChange({
+                      preset: 'custom',
+                      startDate: activeDateRange.startDate || getTodayDateString(),
+                      endDate: activeDateRange.endDate,
+                    });
+                  } else {
+                    const { startDate, endDate } = calculatePresetDates(p.preset);
+                    handleDateRangeChange({ preset: p.preset, startDate, endDate });
+                  }
+                }}
+                className={`px-1.5 py-1 rounded-lg border transition cursor-pointer text-center text-[10px] ${
+                  isSelected
+                    ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-200'
+                }`}
+              >
+                {p.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {activeDateRange.preset === 'custom' && (
+          <div className="space-y-1.5 p-2 bg-white rounded-lg border border-neutral-200 text-xs mt-1">
+            <div className="flex items-center justify-between gap-1.5">
+              <span className="text-[10px] font-semibold text-neutral-600">Od:</span>
+              <input
+                type="date"
+                value={activeDateRange.startDate}
+                onChange={(e) =>
+                  handleDateRangeChange({
+                    preset: 'custom',
+                    startDate: e.target.value,
+                    endDate: activeDateRange.endDate,
+                  })
+                }
+                className="text-[11px] bg-neutral-50 border border-neutral-300 rounded px-1.5 py-0.5 flex-1 text-neutral-800"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-1.5">
+              <span className="text-[10px] font-semibold text-neutral-600">Do:</span>
+              <input
+                type="date"
+                value={activeDateRange.endDate}
+                onChange={(e) =>
+                  handleDateRangeChange({
+                    preset: 'custom',
+                    startDate: activeDateRange.startDate,
+                    endDate: e.target.value,
+                  })
+                }
+                className="text-[11px] bg-neutral-50 border border-neutral-300 rounded px-1.5 py-0.5 flex-1 text-neutral-800"
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Footer Links: Google Calendar Link & Sidebar toggle */}
+      <div className="pt-2 border-t border-neutral-200 flex items-center justify-between gap-2 text-xs">
+        <a
+          href="https://calendar.google.com"
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center space-x-1 text-blue-600 hover:text-blue-800 font-medium hover:underline text-[11px]"
+        >
+          <span>Google Calendar</span>
+          <ExternalLink className="w-3 h-3" />
+        </a>
+
+        {(onToggleSidebar || onCloseSidebar) && (
+          <button
+            type="button"
+            onClick={() => {
+              setShowCalendarControlsMenu(false);
+              if (onToggleSidebar) {
+                onToggleSidebar();
+              } else if (onCloseSidebar) {
+                onCloseSidebar();
+              }
+            }}
+            className="text-neutral-500 hover:text-neutral-800 text-[11px] hover:underline cursor-pointer"
+          >
+            {isSidebarOpen ? 'Ukryj panel boczny' : 'Pokaż panel boczny'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
   return (
-    <div className="bg-white rounded-2xl border border-neutral-200/90 shadow-sm overflow-hidden h-full w-full min-h-0 relative flex flex-col">
+    <div className="calendar-root bg-white rounded-2xl border border-neutral-200/90 shadow-sm overflow-hidden h-full w-full min-h-0 relative flex flex-col">
       {/* Backdrop overlay na całym ekranie */}
       {isSidebarOpen && (
         <div
@@ -931,7 +1805,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
           <button
             type="button"
             id="btn-google-create-event"
-            onClick={() => handleOpenAddEvent()}
+            onClick={() => handleOpenAddEvent(selectedMonthDateStr || toDateString(cursorDate))}
             className="w-full inline-flex items-center justify-center space-x-2.5 px-4 py-2.5 bg-white hover:bg-neutral-50 text-neutral-800 rounded-xl text-xs sm:text-sm font-semibold border border-neutral-250 shadow-xs hover:shadow-md transition-all cursor-pointer"
             title="Utwórz nowe wydarzenie w Kalendarzu Google"
           >
@@ -1073,62 +1947,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
           </div>
         </div>
 
-        {/* 4. Zakres dat (Pionowy DateRangeFilterBar) */}
-        <div className="bg-white p-2.5 rounded-xl border border-neutral-200">
-          <DateRangeFilterBar
-            orientation="vertical"
-            range={activeDateRange}
-            onChangeRange={handleDateRangeChange}
-            totalCount={events.length}
-            filteredCount={filteredEvents.length}
-            accentColor="blue"
-            idPrefix="full-calendar-date-filter"
-          />
-        </div>
-
-        {/* 5. Typy wpisów (Filtr: Wszystkie / Wydarzenia / Zadania) */}
-        <div className="space-y-1">
-          <span className="text-[11px] font-bold text-neutral-500 uppercase tracking-wider px-1">
-            Typy wpisów
-          </span>
-          <div className="grid grid-cols-3 gap-1 bg-white p-1 rounded-xl border border-neutral-200 text-[11px]">
-            <button
-              type="button"
-              onClick={() => handleSelectFilterType('all')}
-              className={`py-1 px-1 rounded-lg text-center font-medium transition cursor-pointer ${
-                filterType === 'all'
-                  ? 'bg-neutral-800 text-white font-semibold'
-                  : 'text-neutral-600 hover:bg-neutral-100'
-              }`}
-            >
-              Wszystkie
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSelectFilterType('events')}
-              className={`py-1 px-1 rounded-lg text-center font-medium transition cursor-pointer ${
-                filterType === 'events'
-                  ? 'bg-blue-600 text-white font-semibold'
-                  : 'text-neutral-600 hover:bg-neutral-100'
-              }`}
-            >
-              Wydarzenia
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSelectFilterType('tasks')}
-              className={`py-1 px-1 rounded-lg text-center font-medium transition cursor-pointer ${
-                filterType === 'tasks'
-                  ? 'bg-emerald-600 text-white font-semibold'
-                  : 'text-neutral-600 hover:bg-neutral-100'
-              }`}
-            >
-              Zadania
-            </button>
-          </div>
-        </div>
-
-        {/* 6. Kalendarze Google */}
+        {/* 4. Kalendarze Google */}
         {calendars.length > 0 && onToggleCalendarId && (
           <div className="bg-white p-2.5 rounded-xl border border-neutral-200 space-y-1.5">
             <div className="flex items-center justify-between">
@@ -1185,7 +2004,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
           </div>
         )}
 
-        {/* 7. Listy zadań w kalendarzu */}
+        {/* 5. Listy zadań w kalendarzu */}
         {(showTaskListsFilter || (taskLists && taskLists.length > 0)) &&
           taskLists.length > 0 &&
           onToggleTaskListId && (
@@ -1241,47 +2060,324 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               </div>
             </div>
           )}
+
+        {/* 6. Elementy w kalendarzu (przesunięte na dół powyżej linka do Google Calendar) */}
+        <div className="space-y-1 bg-white p-2.5 rounded-xl border border-neutral-200">
+          <span className="text-[11px] font-bold text-neutral-600 uppercase tracking-wider block">
+            Elementy w kalendarzu
+          </span>
+          <div className="grid grid-cols-3 gap-1 text-[11px] pt-1">
+            <button
+              type="button"
+              onClick={() => handleSelectFilterType('all')}
+              className={`py-1.5 px-1 rounded-lg text-center font-medium transition cursor-pointer ${
+                filterType === 'all'
+                  ? 'bg-neutral-800 text-white font-semibold'
+                  : 'text-neutral-600 hover:bg-neutral-100'
+              }`}
+            >
+              Wszystkie
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectFilterType('events')}
+              className={`py-1.5 px-1 rounded-lg text-center font-medium transition cursor-pointer ${
+                filterType === 'events'
+                  ? 'bg-blue-600 text-white font-semibold'
+                  : 'text-neutral-600 hover:bg-neutral-100'
+              }`}
+            >
+              Wydarzenia
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectFilterType('tasks')}
+              className={`py-1.5 px-1 rounded-lg text-center font-medium transition cursor-pointer ${
+                filterType === 'tasks'
+                  ? 'bg-emerald-600 text-white font-semibold'
+                  : 'text-neutral-600 hover:bg-neutral-100'
+              }`}
+            >
+              Zadania
+            </button>
+          </div>
+        </div>
+
+        {/* 7. Zakres dat (przesunięty na dół powyżej linka do Google Calendar) */}
+        <div className="bg-white p-2.5 rounded-xl border border-neutral-200 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-bold text-neutral-600 uppercase tracking-wider">
+              Zakres dat
+            </span>
+            <span className="text-[10px] font-semibold text-blue-700">
+              {DATE_PRESET_LABELS[activeDateRange.preset] || activeDateRange.preset}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-1 text-[11px]">
+            {(
+              [
+                { preset: 'all', label: 'Wszystkie' },
+                { preset: 'today', label: 'Dzisiaj' },
+                { preset: 'from_today', label: 'Od dzisiaj' },
+                { preset: 'next_7_days', label: '7 dni' },
+                { preset: 'next_30_days', label: '30 dni' },
+                { preset: 'this_month', label: 'Miesiąc' },
+              ] as const
+            ).map((p) => {
+              const isSelected = activeDateRange.preset === p.preset;
+              return (
+                <button
+                  key={p.preset}
+                  type="button"
+                  onClick={() => {
+                    const { startDate, endDate } = calculatePresetDates(p.preset);
+                    handleDateRangeChange({ preset: p.preset, startDate, endDate });
+                  }}
+                  className={`px-1.5 py-1 rounded-lg border text-[10px] transition cursor-pointer text-center ${
+                    isSelected
+                      ? 'bg-blue-50 text-blue-700 border-blue-300 font-bold'
+                      : 'bg-white hover:bg-neutral-50 text-neutral-700 border-neutral-200'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Link do Google Calendar na dole panelu bocznego */}
+        <div className="pt-2 border-t border-neutral-200 flex items-center justify-between text-xs">
+          <a
+            href="https://calendar.google.com"
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center space-x-1.5 text-blue-600 hover:text-blue-800 font-medium hover:underline text-[11px]"
+          >
+            <span>Google Calendar</span>
+            <ExternalLink className="w-3 h-3" />
+          </a>
+        </div>
         </div>
       </aside>
 
       {/* RIGHT MAIN AREA: Pole wyświetlania kalendarza */}
       <div className="flex-1 w-full min-w-0 h-full flex flex-col bg-white overflow-hidden">
-        {/* Top Mini Header Bar */}
-        <div className="px-3 sm:px-4 py-2 sm:py-2.5 border-b border-neutral-200 bg-white flex items-center justify-between gap-3 shrink-0">
-          <div className="flex items-center space-x-2 min-w-0">
-            <h2 className="text-sm sm:text-base font-bold text-neutral-900 tracking-tight truncate">
+
+        {/* Mobile Date Header Bar */}
+        <div className="sm:hidden px-2.5 py-1.5 border-b border-neutral-200 bg-white flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
+            {/* Przycisk '...' z rozwijaną listą opcji sterowania kalendarzem po lewej stronie od Dzisiaj (kółko z '...' wewnątrz) */}
+            <div className="relative shrink-0 flex items-center" ref={mobileCalendarControlsDropdownRef}>
+              <button
+                type="button"
+                id="btn-mobile-cal-controls"
+                onClick={() => setShowCalendarControlsMenu((prev) => !prev)}
+                className={`p-1.5 rounded-full transition-all cursor-pointer border shadow-2xs flex items-center justify-center ${
+                  showCalendarControlsMenu
+                    ? 'bg-blue-50 border-blue-300 text-blue-700 ring-2 ring-blue-500/20 shadow-xs'
+                    : 'bg-white hover:bg-neutral-100 border-neutral-250 text-neutral-600 hover:text-neutral-900'
+                }`}
+                title={showCalendarControlsMenu ? 'Ukryj opcje sterowania kalendarzem (...)' : 'Pokaż opcje sterowania kalendarzem (...)'}
+                aria-label="Opcje sterowania kalendarzem"
+              >
+                <MoreHorizontal className="w-4 h-4 stroke-[2.5]" />
+              </button>
+
+              {showCalendarControlsMenu && (
+                <div className="absolute left-0 top-full mt-1.5 z-50 w-72 max-w-[88vw] bg-white rounded-2xl border border-neutral-200 shadow-xl p-3">
+                  {renderCalendarControlsMenuContent()}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center space-x-0.5 shrink-0 bg-neutral-100 p-0.5 rounded-lg border border-neutral-200">
+              <button
+                type="button"
+                onClick={handleGoToday}
+                className="py-0.5 px-2 rounded-md text-[11px] font-semibold text-neutral-700 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+              >
+                Dzisiaj
+              </button>
+              <button
+                type="button"
+                onClick={handlePrev}
+                className="p-1 rounded-md text-neutral-600 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={handleNext}
+                className="p-1 rounded-md text-neutral-600 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Skróty szybkiego przełączania widoków: Miesiąc (M), 4 tygodnie (4) i Tydzień (T) */}
+            <div className="flex items-center space-x-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => handleSelectViewMode('miesiac')}
+                className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === 'miesiac'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku miesiąca (M)"
+                aria-label="Widok miesiąca"
+              >
+                M
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSelectViewMode('4tygodnie')}
+                className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === '4tygodnie'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku 4 tygodni (4)"
+                aria-label="Widok 4 tygodni"
+              >
+                4
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSelectViewMode('tydzien')}
+                className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === 'tydzien'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku tygodnia (T)"
+                aria-label="Widok tygodnia"
+              >
+                T
+              </button>
+            </div>
+          </div>
+          <h2 className="text-xs font-bold text-neutral-900 tracking-tight truncate text-right">
+            {headerTitle}
+          </h2>
+        </div>
+
+        {/* Desktop Main Calendar Toolbar */}
+        <div className="hidden sm:flex px-3 sm:px-4 py-2 sm:py-2.5 border-b border-neutral-200 bg-white flex-wrap items-center justify-between gap-2.5 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-2.5 min-w-0">
+            {/* Przycisk '...' z rozwijaną listą opcji sterowania kalendarzem po lewej stronie od Dzisiaj (kółko z '...' wewnątrz) */}
+            <div className="relative shrink-0 flex items-center" ref={calendarControlsDropdownRef}>
+              <button
+                type="button"
+                id="btn-main-cal-controls"
+                onClick={() => setShowCalendarControlsMenu((prev) => !prev)}
+                className={`p-1.5 rounded-full transition-all cursor-pointer border shadow-2xs flex items-center justify-center ${
+                  showCalendarControlsMenu
+                    ? 'bg-blue-50 border-blue-300 text-blue-700 ring-2 ring-blue-500/20 shadow-xs'
+                    : 'bg-white hover:bg-neutral-100 border-neutral-250 text-neutral-600 hover:text-neutral-900'
+                }`}
+                title={showCalendarControlsMenu ? 'Ukryj opcje sterowania kalendarzem (...)' : 'Pokaż opcje sterowania kalendarzem (...)'}
+                aria-label="Opcje sterowania kalendarzem"
+              >
+                <MoreHorizontal className="w-4 h-4 stroke-[2.5]" />
+              </button>
+
+              {showCalendarControlsMenu && (
+                <div className="absolute left-0 top-full mt-1.5 z-50 w-72 sm:w-80 bg-white rounded-2xl border border-neutral-200 shadow-xl p-3 sm:p-3.5">
+                  {renderCalendarControlsMenuContent()}
+                </div>
+              )}
+            </div>
+
+            {/* Quick Period Navigation (Dzisiaj, <, >) */}
+            <div className="flex items-center space-x-0.5 sm:space-x-1 shrink-0 bg-neutral-100 p-0.5 rounded-lg border border-neutral-200">
+              <button
+                type="button"
+                id="btn-main-cal-today"
+                onClick={handleGoToday}
+                className="py-1 px-2 sm:px-2.5 rounded-md text-xs font-semibold text-neutral-700 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+                title="Przejdź do dzisiaj"
+              >
+                Dzisiaj
+              </button>
+              <button
+                type="button"
+                id="btn-main-cal-prev"
+                onClick={handlePrev}
+                className="p-1 rounded-md text-neutral-600 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+                title="Poprzedni okres (możesz też przewijać kółkiem myszy)"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                id="btn-main-cal-next"
+                onClick={handleNext}
+                className="p-1 rounded-md text-neutral-600 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+                title="Następny okres (możesz też przewijać kółkiem myszy)"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Skróty szybkiego przełączania widoków: Miesiąc (M), 4 tygodnie (4) i Tydzień (T) */}
+            <div className="flex items-center space-x-1 shrink-0">
+              <button
+                type="button"
+                id="btn-shortcut-month"
+                onClick={() => handleSelectViewMode('miesiac')}
+                className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === 'miesiac'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku miesiąca (skrót klawiszowy: M)"
+                aria-label="Widok miesiąca (M)"
+              >
+                M
+              </button>
+              <button
+                type="button"
+                id="btn-shortcut-4weeks"
+                onClick={() => handleSelectViewMode('4tygodnie')}
+                className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === '4tygodnie'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku 4 tygodni (4)"
+                aria-label="Widok 4 tygodni (4)"
+              >
+                4
+              </button>
+              <button
+                type="button"
+                id="btn-shortcut-week"
+                onClick={() => handleSelectViewMode('tydzien')}
+                className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === 'tydzien'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku tygodnia (skrót klawiszowy: W)"
+                aria-label="Widok tygodnia (T)"
+              >
+                T
+              </button>
+            </div>
+
+            {/* Wyświetlany zakres dat */}
+            <h2 className="text-sm sm:text-base font-bold text-neutral-900 tracking-tight whitespace-nowrap">
               {headerTitle}
             </h2>
-            {selectedCalendar && (
-              <span
-                className="text-xs px-2.5 py-0.5 rounded-full font-medium flex items-center gap-1.5 border shrink-0"
-                style={{
-                  backgroundColor: selectedCalendar.backgroundColor ? `${selectedCalendar.backgroundColor}15` : '#eff6ff',
-                  borderColor: selectedCalendar.backgroundColor ? `${selectedCalendar.backgroundColor}40` : '#bfdbfe',
-                  color: selectedCalendar.backgroundColor || '#1d4ed8',
-                }}
-              >
-                <span
-                  className="w-2 h-2 rounded-full shrink-0"
-                  style={{ backgroundColor: selectedCalendar.backgroundColor || '#3b82f6' }}
-                />
-                <span className="truncate max-w-[140px]">{selectedCalendar.summary}</span>
-              </span>
-            )}
+
           </div>
 
           <div className="flex items-center space-x-2 shrink-0">
-            {onBackToDashboard && (
-              <button
-                type="button"
-                onClick={onBackToDashboard}
-                className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-neutral-700 bg-white hover:bg-neutral-100 border border-neutral-250 transition cursor-pointer shadow-2xs"
-                title="Powrót do pulpitu"
-              >
-                <LayoutDashboard className="w-3.5 h-3.5 text-blue-600" />
-                <span className="hidden sm:inline">Pulpit</span>
-              </button>
-            )}
+            <span className="hidden xl:inline-flex items-center text-[11px] text-neutral-400 bg-neutral-50 border border-neutral-200/80 px-2 py-0.5 rounded-lg select-none">
+              ↔ Przeciągnij w bok, aby zmienić okres
+            </span>
             <div className="text-[11px] text-neutral-500">
               {filteredEvents.length === events.length ? (
                 <span>{events.length} pozycji</span>
@@ -1321,11 +2417,43 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
           </div>
         )}
 
-        {/* Main Calendar View Body */}
-        <div className="flex-1 min-h-0 overflow-hidden bg-white min-w-0 w-full flex flex-col">
-        {/* VIEW 1: Harmonogram (Agenda) */}
+        {/* Main Calendar View Body with sideways dragging / swipe gesture to slide date range and mouse wheel scrolling */}
+        <div
+          ref={calendarBodyRef}
+          className={`flex-1 min-h-0 overflow-hidden bg-white min-w-0 w-full flex flex-col relative ${
+            isSwiping ? 'cursor-grabbing select-none' : ''
+          }`}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          onTouchCancel={handleTouchEnd}
+          onMouseDown={handleMouseDown}
+        >
+          {/* Visual floating indicators when dragging sideways */}
+          {dragOffset > 25 && (
+            <div className="absolute left-3 top-1/2 -translate-y-1/2 z-30 pointer-events-none flex items-center space-x-1.5 px-3.5 py-2 bg-blue-600/95 text-white rounded-full shadow-xl backdrop-blur-xs text-xs font-bold animate-pulse ring-2 ring-white/50">
+              <ChevronLeft className="w-4 h-4 stroke-[3]" />
+              <span>Poprzedni okres</span>
+            </div>
+          )}
+          {dragOffset < -25 && (
+            <div className="absolute right-3 top-1/2 -translate-y-1/2 z-30 pointer-events-none flex items-center space-x-1.5 px-3.5 py-2 bg-blue-600/95 text-white rounded-full shadow-xl backdrop-blur-xs text-xs font-bold animate-pulse ring-2 ring-white/50">
+              <span>Następny okres</span>
+              <ChevronRight className="w-4 h-4 stroke-[3]" />
+            </div>
+          )}
+
+          {/* Sliding container with smooth drag offset */}
+          <div
+            className="flex-1 min-h-0 w-full flex flex-col overflow-hidden"
+            style={{
+              transform: dragOffset !== 0 ? `translateX(${dragOffset}px)` : 'translateX(0)',
+              transition: isSwiping ? 'none' : 'transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1)',
+            }}
+          >
+            {/* VIEW 1: Harmonogram (Agenda) */}
         {viewMode === 'harmonogram' && (
-          <div className="flex-1 min-h-0 overflow-y-auto p-3 sm:p-5 w-full">
+          <div className="flex-1 min-h-0 overflow-y-auto p-3 sm:p-5 w-full calendar-scrollbar">
             <div className="space-y-4 max-w-4xl mx-auto py-2">
             {filteredEvents.length === 0 ? (
               <div className="text-center py-16 text-neutral-400 space-y-2">
@@ -1364,7 +2492,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                         {dayEvents.map((event) => {
                           const isGenerated = !!generatedTripMap[event.id];
                           const isTask = isCalendarTaskEvent(event);
-                          const isRecurring = isEventRecurring(event);
+                          const isCompleted = isTask && isTaskCompleted(event);
                           const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
                           const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
 
@@ -1375,10 +2503,13 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               style={{
                                 borderLeftColor: colorDef.hex,
                                 borderLeftWidth: '4px',
+                                opacity: isCompleted ? 0.55 : 1,
                               }}
                               className={`p-3 rounded-xl border transition-all hover:shadow-xs cursor-pointer flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-                                colorDef.id === 'birch'
-                                   ? 'bg-[#f7f5f2]/80 border-[#d7d0c7] hover:border-[#a79b8e]'
+                                isCompleted
+                                  ? 'bg-neutral-50/70 border-neutral-200/60 hover:opacity-85'
+                                  : colorDef.id === 'birch'
+                                  ? 'bg-[#f7f5f2]/80 border-[#d7d0c7] hover:border-[#a79b8e]'
                                   : isGenerated
                                   ? 'bg-blue-50/30 border-neutral-200 hover:border-neutral-300'
                                   : 'bg-white border-neutral-200 hover:border-neutral-300'
@@ -1388,7 +2519,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                 <div className="mt-0.5">
                                   <span className="inline-flex items-center text-xs font-semibold text-neutral-700 bg-neutral-100 border border-neutral-200 px-2 py-0.5 rounded-md">
                                     <Clock className="w-3 h-3 mr-1 text-neutral-500" />
-                                    {formatEventTime(event)}
+                                    {formatEventStartTime(event) || 'Cały dzień'}
                                   </span>
                                 </div>
                                 <div className="min-w-0">
@@ -1397,19 +2528,19 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                       className="w-2.5 h-2.5 rounded-full shrink-0 shadow-2xs"
                                       style={{ backgroundColor: colorDef.hex }}
                                     />
-                                    <h4 className="text-sm font-semibold text-neutral-900 truncate">
-                                      {event.summary}
+                                    <h4 className={`text-sm font-semibold truncate ${isCompleted ? 'line-through text-neutral-400' : 'text-neutral-900'}`}>
+                                      {formatEventStartTime(event) ? `${formatEventStartTime(event)} ` : ''}{event.summary}
                                     </h4>
-                                    {isRecurring && (
-                                      <span className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded font-medium bg-purple-50 text-purple-700 border border-purple-200">
-                                        <RotateCw className="w-2.5 h-2.5 mr-1 text-purple-600" />
-                                        Powtarzalne
-                                      </span>
-                                    )}
-                                    {isTask && colorDef.id === 'birch' ? (
-                                      <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-[#e8e4de] text-[#4a4137] border border-[#d7d0c7]">
-                                        {event.calendarSummary || 'Zadanie'}
-                                      </span>
+                                    {isTask ? (
+                                      isCompleted ? (
+                                        <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-neutral-100 text-neutral-500 border border-neutral-200">
+                                          Ukończone ✓
+                                        </span>
+                                      ) : (
+                                        <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-emerald-50 text-emerald-800 border border-emerald-200">
+                                          Do zrobienia ○
+                                        </span>
+                                      )
                                     ) : (
                                       <span
                                         className="text-[10px] px-1.5 py-0.5 rounded font-medium border"
@@ -1499,28 +2630,44 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
           </div>
         )}
 
-        {/* VIEW 2: Dzień (Day view with 24-hour grid from 00:00 to 24:00) */}
+        {/* VIEW 2: Dzień (Day view with 24-hour grid from 00:00 to 24:00, default display 6:00 to 22:00) */}
         {viewMode === 'dzien' && (
-          <div className="flex-1 min-h-0 overflow-y-auto p-2 sm:p-4 w-full">
-            <div className="max-w-4xl mx-auto py-1 space-y-4">
-            {/* Day Header Banner */}
-            <div className="p-4 rounded-xl bg-blue-50/60 border border-blue-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <span className="text-xs font-semibold text-blue-700 uppercase tracking-wider">
-                  Widok Dnia &bull; Siatka 24-godzinna
+          <div className="w-full min-w-0 h-full flex-1 flex flex-col bg-white overflow-hidden">
+            {/* 1. Header with Current Day */}
+            <div className="flex border-b border-neutral-200 bg-neutral-50/90 sticky top-0 z-30 shrink-0 px-3 sm:px-4 py-2 items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <span
+                  className={`w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center text-xs sm:text-sm font-bold ${
+                    toDateString(cursorDate) === todayStr
+                      ? 'bg-blue-600 text-white shadow-xs'
+                      : 'bg-neutral-200 text-neutral-800'
+                  }`}
+                >
+                  {cursorDate.getDate()}
                 </span>
-                <h3 className="text-lg font-bold text-neutral-900 mt-0.5">
-                  {DAY_NAMES_PL[cursorDate.getDay() === 0 ? 6 : cursorDate.getDay() - 1]},{' '}
-                  {cursorDate.getDate()} {MONTH_NAMES_GENITIVE_PL[cursorDate.getMonth()]}{' '}
-                  {cursorDate.getFullYear()}
-                </h3>
+                <div>
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs sm:text-sm font-bold text-neutral-900 leading-tight">
+                      {DAY_NAMES_PL[cursorDate.getDay() === 0 ? 6 : cursorDate.getDay() - 1]}
+                    </span>
+                    {toDateString(cursorDate) === todayStr && (
+                      <span className="text-[10px] font-semibold text-blue-700 bg-blue-100/80 px-1.5 py-0.5 rounded">
+                        Dzisiaj
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-[10px] text-neutral-500 block">
+                    {cursorDate.getDate()} {MONTH_NAMES_GENITIVE_PL[cursorDate.getMonth()]} {cursorDate.getFullYear()}
+                  </span>
+                </div>
               </div>
+
               <button
                 type="button"
                 onClick={() => handleOpenAddEvent(toDateString(cursorDate))}
-                className="inline-flex items-center space-x-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition shadow-2xs cursor-pointer self-start sm:self-auto"
+                className="inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition shadow-2xs cursor-pointer"
               >
-                <Plus className="w-4 h-4" />
+                <Plus className="w-3.5 h-3.5" />
                 <span>Dodaj na ten dzień</span>
               </button>
             </div>
@@ -1538,25 +2685,20 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               const now = new Date();
               const currentHour = now.getHours();
               const currentMin = now.getMinutes();
-              const currentTop = (currentHour * 60 + currentMin) * (48 / 60);
+              const currentTop = (currentHour * 60 + currentMin) * (hourHeight / 60);
 
               return (
-                <div className="space-y-4">
-                  {/* Top Bar for All-day & >24h events */}
+                <div className="flex-1 min-h-0 flex flex-col w-full overflow-hidden">
+                  {/* All-Day Events Row */}
                   {allDayOrLongEvents.length > 0 && (
-                    <div className="p-3 bg-amber-50/80 border border-amber-200/90 rounded-xl space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-amber-900 uppercase tracking-wide flex items-center gap-1.5">
-                          <Clock className="w-3.5 h-3.5 text-amber-600" />
-                          Całodniowe i trwające &gt;24h ({allDayOrLongEvents.length})
-                        </span>
-                        <span className="text-[10px] text-amber-800 font-semibold bg-amber-100/90 px-2 py-0.5 rounded-md border border-amber-200">
-                          Pasek całodniowy
-                        </span>
+                    <div className="flex border-b border-neutral-200 bg-neutral-50/40 text-xs shrink-0 px-3 py-1.5 items-center gap-2">
+                      <div className="w-12 sm:w-16 shrink-0 text-right pr-2 text-[10px] font-semibold text-neutral-500">
+                        Cały dzień:
                       </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <div className="flex-1 flex flex-wrap gap-1.5 max-h-20 overflow-y-auto calendar-scrollbar">
                         {allDayOrLongEvents.map((event) => {
                           const isTask = isCalendarTaskEvent(event);
+                          const isCompleted = isTask && isTaskCompleted(event);
                           const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
                           const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
 
@@ -1565,38 +2707,17 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               key={event.id}
                               onClick={() => setPreviewEvent(event)}
                               style={{
-                                backgroundColor: colorDef.bg,
-                                borderColor: colorDef.border,
+                                backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
+                                color: isCompleted ? '#6b7280' : colorDef.contrastText,
+                                borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.1)',
+                                opacity: isCompleted ? 0.55 : 1,
                               }}
-                              className="p-2.5 rounded-lg border transition cursor-pointer flex items-center justify-between gap-2 shadow-2xs hover:brightness-95 select-none"
+                              className={`text-[10px] sm:text-xs px-2 py-1 rounded-lg font-medium cursor-pointer transition shadow-2xs select-none border flex items-center space-x-1.5 ${
+                                isCompleted ? 'hover:opacity-85 line-through' : 'hover:brightness-95'
+                              }`}
                             >
-                              <div className="min-w-0 flex-1">
-                                <div className="flex items-center space-x-1.5">
-                                  <span
-                                    className="w-2.5 h-2.5 rounded-full shrink-0 shadow-2xs"
-                                    style={{ backgroundColor: colorDef.hex }}
-                                  />
-                                  <h5 className="text-xs font-bold truncate" style={{ color: colorDef.text }}>
-                                    {event.summary}
-                                  </h5>
-                                </div>
-                                <p className="text-[10px] opacity-80 truncate pl-4" style={{ color: colorDef.text }}>
-                                  {getEventDateSpan(event).length > 1 ? `${getEventDateSpan(event).length} dni` : 'Cały dzień'}
-                                  {event.location ? ` • ${event.location}` : ''}
-                                </p>
-                              </div>
-                              {isTask && (
-                                <span
-                                  className="text-[9px] px-1.5 py-0.5 rounded font-bold border shrink-0"
-                                  style={{
-                                    backgroundColor: colorDef.bg,
-                                    borderColor: colorDef.border,
-                                    color: colorDef.text,
-                                  }}
-                                >
-                                  Zadanie
-                                </span>
-                              )}
+                              <span>{isTask ? (isCompleted ? '✓' : '○') : '●'}</span>
+                              <span className="font-semibold truncate max-w-[200px]">{event.summary}</span>
                             </div>
                           );
                         })}
@@ -1604,128 +2725,137 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                     </div>
                   )}
 
-                  {/* 24-Hour Vertical Grid (00:00 to 24:00 - Od północy do północy) */}
-                  <div className="bg-white rounded-2xl border border-neutral-200 overflow-hidden shadow-2xs">
-                    <div className="p-2.5 border-b border-neutral-100 bg-neutral-50/60 flex items-center justify-between text-xs text-neutral-500">
-                      <span className="font-medium">Siatka 24-godzinna (od 00:00 do 24:00)</span>
-                      <span className="text-[11px]">Kliknij dowolną godzinę, aby dodać wydarzenie</span>
-                    </div>
-
-                    <div
-                      ref={dayScrollRef}
-                      className="overflow-y-auto max-h-[580px] relative flex select-none divide-x divide-neutral-200"
-                    >
-                      {/* Left Column: 24 Hour Labels (00:00 to 24:00) */}
-                      <div className="w-16 shrink-0 bg-neutral-50/70 border-r border-neutral-200 text-right pr-2">
-                        {HOURS_24.map((hour) => (
-                          <div
-                            key={hour}
-                            className="h-[48px] border-b border-neutral-100 flex items-start justify-end pt-1"
-                          >
-                            <span className="text-[10px] font-medium text-neutral-400">
-                              {String(hour).padStart(2, '0')}:00
-                            </span>
-                          </div>
-                        ))}
-                        <div className="h-[24px] flex items-start justify-end pt-0.5">
-                          <span className="text-[10px] font-semibold text-neutral-500">
-                            24:00
+                  {/* 24-Hour Scrollable Grid (default displays 6:00 to 22:00) */}
+                  <div
+                    ref={dayScrollRef}
+                    className="overflow-y-auto flex-1 min-h-0 relative flex select-none divide-x divide-neutral-200 w-full calendar-scrollbar"
+                  >
+                    {/* Left Column: 24 Hour Labels (00:00 to 24:00) */}
+                    <div className="w-12 sm:w-16 shrink-0 bg-neutral-50/70 border-r border-neutral-200 text-right pr-1 sm:pr-2">
+                      {HOURS_24.map((hour) => (
+                        <div
+                          key={hour}
+                          style={{ height: `${hourHeight}px` }}
+                          className="border-b border-neutral-100 flex items-start justify-end pt-1"
+                        >
+                          <span className="text-[8px] sm:text-[10px] font-medium text-neutral-400">
+                            {String(hour).padStart(2, '0')}:00
                           </span>
                         </div>
+                      ))}
+                      <div className="h-[24px] flex items-start justify-end pt-0.5">
+                        <span className="text-[8px] sm:text-[10px] font-semibold text-neutral-500">
+                          24:00
+                        </span>
                       </div>
+                    </div>
 
-                      {/* Main Day Timeline Slot Column */}
-                      <div className="flex-1 relative h-[1152px] bg-white">
-                        {/* Current live time indicator line */}
-                        {isToday && (
+                    {/* Main Day Timeline Slot Column */}
+                    <div
+                      style={{ height: `${24 * hourHeight}px` }}
+                      className="flex-1 relative bg-white"
+                    >
+                      {/* Current live time indicator line */}
+                      {isToday && (
+                        <div
+                          className="absolute left-0 right-0 border-t-2 border-red-500 z-20 pointer-events-none flex items-center"
+                          style={{ top: `${currentTop}px` }}
+                        >
+                          <div className="w-2.5 h-2.5 rounded-full bg-red-500 -ml-1.5 shadow-xs" />
+                          <span className="text-[9px] font-bold text-red-600 bg-white/90 px-1 py-0.5 rounded shadow-2xs ml-1">
+                            Teraz ({String(now.getHours()).padStart(2, '0')}:{String(now.getMinutes()).padStart(2, '0')})
+                          </span>
+                        </div>
+                      )}
+
+                      {/* 24 Hour Background Clickable Grid Slots */}
+                      {HOURS_24.map((hour) => {
+                        const timeStr = `${String(hour).padStart(2, '0')}:00`;
+                        return (
                           <div
-                            className="absolute left-0 right-0 border-t-2 border-red-500 z-20 pointer-events-none flex items-center"
-                            style={{ top: `${currentTop}px` }}
+                            key={hour}
+                            style={{ height: `${hourHeight}px` }}
+                            onClick={() => handleOpenAddEvent(currentDayKey, timeStr)}
+                            className="border-b border-neutral-100 hover:bg-blue-50/40 cursor-pointer transition-colors group relative"
+                            title={`Kliknij, aby dodać wydarzenie o ${timeStr}`}
                           >
-                            <div className="w-2.5 h-2.5 rounded-full bg-red-500 -ml-1.5 shadow-xs" />
-                            <span className="text-[9px] font-bold text-red-600 bg-white/90 px-1 py-0.5 rounded shadow-2xs ml-1">
-                              Teraz ({String(now.getHours()).padStart(2, '0')}:{String(now.getMinutes()).padStart(2, '0')})
+                            <span className="absolute left-3 top-1 text-[10px] font-medium text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                              + Dodaj wydarzenie o {timeStr}
                             </span>
                           </div>
-                        )}
+                        );
+                      })}
 
-                        {/* 24 Hour Background Clickable Grid Slots */}
-                        {HOURS_24.map((hour) => {
-                          const timeStr = `${String(hour).padStart(2, '0')}:00`;
+                      {/* Timed Events positioned with overlap layout & Google Calendar colors */}
+                      {(() => {
+                        const dayLayouts = computeDayTimedEventLayouts(timedEvents, hourHeight, 24 * hourHeight);
+                        return dayLayouts.map((item) => {
+                          const ev = item.event;
+                          const isTask = isCalendarTaskEvent(ev);
+                          const isCompleted = isTask && isTaskCompleted(ev);
+                          const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
+                          const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+
+                          const startStr = formatEventStartTime(ev);
+                          const isVerySmall = item.heightPx <= 28;
+                          const isSmall = item.heightPx <= 42;
+
                           return (
                             <div
-                              key={hour}
-                              onClick={() => handleOpenAddEvent(currentDayKey, timeStr)}
-                              className="h-[48px] border-b border-neutral-100 hover:bg-blue-50/40 cursor-pointer transition-colors group relative"
-                              title={`Kliknij, aby dodać wydarzenie o ${timeStr}`}
+                              key={ev.id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setPreviewEvent(ev);
+                              }}
+                              style={{
+                                top: `${item.topPx}px`,
+                                height: `${item.heightPx}px`,
+                                left: `${item.leftPercent}%`,
+                                width:
+                                  item.widthPercent === 100
+                                    ? 'calc(100% - 12px)'
+                                    : `calc(${item.widthPercent}% - 8px)`,
+                                backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
+                                color: isCompleted ? '#6b7280' : colorDef.contrastText,
+                                borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.12)',
+                                opacity: isCompleted ? 0.55 : 1,
+                                zIndex: item.zIndex ?? 10,
+                              }}
+                              className={`absolute ${
+                                isVerySmall
+                                  ? 'rounded-md px-1.5 py-0 justify-center'
+                                  : isSmall
+                                  ? 'rounded-lg px-2 py-0.5 justify-start'
+                                  : 'rounded-xl px-2.5 py-1 justify-start'
+                              } text-left border shadow-2xs cursor-pointer overflow-hidden transition-all hover:z-40 hover:shadow-md flex flex-col items-start select-none group ${
+                                isCompleted ? 'hover:opacity-85' : 'hover:brightness-95'
+                              }`}
+                              title={`${startStr ? `${startStr} ` : ''}${ev.summary}`}
                             >
-                              <span className="absolute left-3 top-1 text-[10px] font-medium text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                                + Dodaj wydarzenie o {timeStr}
-                              </span>
-                            </div>
-                          );
-                        })}
-
-                        {/* Timed Events positioned with overlap layout & Google Calendar colors */}
-                        {(() => {
-                          const dayLayouts = computeDayTimedEventLayouts(timedEvents, 48, 1152);
-                          return dayLayouts.map((item) => {
-                            const ev = item.event;
-                            const isTask = isCalendarTaskEvent(ev);
-                            const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
-                            const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
-
-                            return (
-                              <div
-                                key={ev.id}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setPreviewEvent(ev);
-                                }}
-                                style={{
-                                  top: `${item.topPx}px`,
-                                  height: `${item.heightPx}px`,
-                                  left: `${item.leftPercent}%`,
-                                  width:
-                                    item.widthPercent === 100
-                                      ? 'calc(100% - 12px)'
-                                      : `calc(${item.widthPercent}% - 8px)`,
-                                  backgroundColor: colorDef.hex,
-                                  color: colorDef.contrastText,
-                                }}
-                                className="absolute rounded-xl px-3 py-1.5 text-left border border-black/10 shadow-2xs cursor-pointer z-10 overflow-hidden transition-all hover:z-30 hover:shadow-md flex items-center justify-between gap-3 select-none group"
-                                title={`${ev.summary} (${formatEventTime(ev)})`}
-                              >
-                                <div className="min-w-0 flex-1">
-                                  <div className="flex items-center space-x-2">
-                                    <span className="font-bold text-xs truncate">
-                                      {isEventRecurring(ev) ? '🔁 ' : ''}{isTask ? '✓ ' : ''}{ev.summary}
-                                    </span>
-                                    <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-black/15 shrink-0">
-                                      {formatEventTime(ev)}
-                                    </span>
-                                    {isTask && (
-                                      <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-white/20 shrink-0">
-                                        Zadanie
-                                      </span>
-                                    )}
-                                  </div>
-                                  {item.heightPx >= 44 && ev.location && (
-                                    <p className="text-[11px] opacity-90 flex items-center gap-1 truncate mt-0.5">
-                                      <MapPin className="w-3 h-3 opacity-75 shrink-0" />
-                                      <span>{ev.location}</span>
-                                    </p>
-                                  )}
-                                </div>
-
-                                <div
-                                  className="flex items-center space-x-1 shrink-0 opacity-80 group-hover:opacity-100"
-                                  onClick={(e) => e.stopPropagation()}
+                              <div className="w-full flex items-center justify-between gap-1 leading-none text-left">
+                                <span
+                                  className={`${
+                                    isVerySmall
+                                      ? 'text-[9px] leading-tight sm:text-[10px]'
+                                      : isSmall
+                                      ? 'text-[10px] leading-tight sm:text-xs'
+                                      : 'text-xs sm:text-sm leading-snug'
+                                  } font-semibold truncate text-left ${isCompleted ? 'line-through opacity-75' : ''}`}
                                 >
+                                  {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                                  {startStr ? `${startStr} ` : ''}
+                                  {ev.summary}
+                                </span>
+
+                                {!isVerySmall && (
+                                  <div className="flex items-center space-x-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
                                   {onUpdateCalendarEvent && (
                                     <button
                                       type="button"
-                                      onClick={() => handleOpenEditEvent(ev)}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleOpenEditEvent(ev);
+                                      }}
                                       className="p-1 rounded-md bg-black/10 hover:bg-black/20 transition cursor-pointer"
                                       title="Edytuj"
                                     >
@@ -1735,7 +2865,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                   {onCreateCalendarEvent && (
                                     <button
                                       type="button"
-                                      onClick={() => handleDuplicateEvent(ev)}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDuplicateEvent(ev);
+                                      }}
                                       className="p-1 rounded-md bg-black/10 hover:bg-black/20 transition cursor-pointer"
                                       title="Duplikuj"
                                     >
@@ -1745,7 +2878,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                   {onDeleteCalendarEvent && (
                                     <button
                                       type="button"
-                                      onClick={() => handleDeleteEventClick(ev.id)}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDeleteEventClick(ev.id);
+                                      }}
                                       className="p-1 rounded-md bg-black/10 hover:bg-black/20 transition cursor-pointer"
                                       title="Usuń"
                                     >
@@ -1753,28 +2889,35 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                     </button>
                                   )}
                                 </div>
-                              </div>
-                            );
-                          });
-                        })()}
-                      </div>
+                              )}
+                            </div>
+
+                              {item.heightPx >= 44 && ev.location && (
+                                <div className="flex items-center text-[10px] sm:text-xs opacity-90 mt-0.5 truncate text-left">
+                                  <MapPin className="w-3 h-3 mr-1 opacity-75 shrink-0" />
+                                  <span className="truncate">{ev.location}</span>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        });
+                      })()}
                     </div>
                   </div>
                 </div>
               );
             })()}
-            </div>
           </div>
         )}
 
         {/* VIEW 3: Tydzień (Week view with 24-hour grid from 00:00 to 24:00) */}
         {viewMode === 'tydzien' && (
           <div className="w-full min-w-0 h-full flex-1 flex flex-col bg-white overflow-hidden">
-            {/* 1. Header with Week Days */}
-            <div className="flex border-b border-neutral-200 bg-neutral-50/90 sticky top-0 z-30 shrink-0">
+            {/* 1. Header with Week Days: dzień tygodnia, numer dnia i przycisk dodaj w jednej linii */}
+            <div className="flex border-b border-neutral-200 bg-neutral-50/90 sticky top-0 z-30 shrink-0 h-8 sm:h-9">
               {/* Corner Time Column Header */}
-              <div className="w-10 sm:w-16 shrink-0 p-1 sm:p-2 flex flex-col items-center justify-center border-r border-neutral-200 text-neutral-400">
-                <Clock className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-neutral-400 mb-0.5" />
+              <div className="w-10 sm:w-16 shrink-0 px-1 py-1 flex items-center justify-center border-r border-neutral-200 text-neutral-400">
+                <Clock className="w-3 h-3 text-neutral-400 mr-1 hidden sm:inline" />
                 <span className="text-[8px] sm:text-[10px] font-semibold tracking-wider uppercase">Godz.</span>
               </div>
 
@@ -1787,28 +2930,34 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                   return (
                     <div
                       key={dateStr}
-                      className={`p-1 sm:p-2 text-center flex flex-col items-center justify-between group transition-colors min-w-0 overflow-hidden ${
+                      className={`px-1 py-1 sm:px-1.5 text-center flex flex-row items-center justify-between group transition-colors min-w-0 overflow-hidden h-full ${
                         isToday
-                          ? 'bg-blue-50/50'
+                          ? 'bg-blue-50/70'
                           : isCurrentCursor
                           ? 'bg-neutral-50/60'
                           : 'bg-transparent hover:bg-neutral-50/40'
                       }`}
                     >
-                      <span
-                        className={`text-[9px] sm:text-[11px] font-semibold uppercase tracking-wider truncate ${
-                          isToday ? 'text-blue-600' : 'text-neutral-500'
-                        }`}
-                      >
-                        {DAY_NAMES_SHORT_PL[dayIndex]}
-                      </span>
-                      <div className="flex items-center space-x-1.5 my-0.5 sm:my-1">
+                      <div className="flex items-center space-x-1 min-w-0">
                         <span
-                          className={`w-6 h-6 sm:w-9 sm:h-9 rounded-full flex items-center justify-center text-xs sm:text-sm font-medium transition-all ${
+                          className={`text-[9px] sm:text-[11px] font-semibold uppercase tracking-wider shrink-0 ${
+                            isToday ? 'text-blue-600 font-bold' : 'text-neutral-500'
+                          }`}
+                        >
+                          {DAY_NAMES_SHORT_PL[dayIndex]}
+                        </span>
+                        <span
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setCursorDate(date);
+                            handleSelectViewMode('dzien');
+                          }}
+                          className={`w-5 h-5 sm:w-6 sm:h-6 rounded-full flex items-center justify-center text-[10px] sm:text-xs font-semibold shrink-0 cursor-pointer transition-all hover:scale-110 hover:ring-2 hover:ring-blue-400 ${
                             isToday
-                              ? 'bg-blue-600 text-white font-bold shadow-xs'
+                              ? 'bg-blue-600 text-white font-bold shadow-2xs'
                               : 'text-neutral-800 hover:bg-neutral-200/70'
                           }`}
+                          title="Kliknij, aby przejść do widoku dnia"
                         >
                           {date.getDate()}
                         </span>
@@ -1816,10 +2965,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                       <button
                         type="button"
                         onClick={() => handleOpenAddEvent(dateStr)}
-                        className="text-[8px] sm:text-[10px] text-neutral-400 group-hover:text-blue-600 font-medium cursor-pointer px-1 py-0.5 rounded hover:bg-blue-50 transition truncate max-w-full"
+                        className="text-[10px] sm:text-xs text-neutral-400 hover:text-blue-600 font-bold cursor-pointer w-4 h-4 sm:w-5 sm:h-5 flex items-center justify-center rounded hover:bg-blue-100 transition shrink-0"
                         title="Dodaj wydarzenie na ten dzień"
                       >
-                        + Dodaj
+                        +
                       </button>
                     </div>
                   );
@@ -1839,9 +2988,15 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                   const allDayEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev));
 
                   return (
-                    <div key={`allday-${dateStr}`} className="px-0.5 sm:px-1 py-0.5 min-h-[28px] sm:min-h-[32px] space-y-1 min-w-0 overflow-hidden">
+                    <div
+                      key={`allday-${dateStr}`}
+                      onDoubleClick={() => handleOpenAddEvent(dateStr)}
+                      className="px-0.5 sm:px-1 py-0.5 min-h-[28px] sm:min-h-[32px] space-y-1 min-w-0 max-h-20 overflow-y-auto day-cell-scrollbar"
+                      title="Podwójne kliknięcie: utwórz wydarzenie całodniowe"
+                    >
                       {allDayEvents.map((ev) => {
                         const isTask = isCalendarTaskEvent(ev);
+                        const isCompleted = isTask && isTaskCompleted(ev);
                         const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
                         const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
 
@@ -1850,14 +3005,18 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                             key={ev.id}
                             onClick={() => setPreviewEvent(ev)}
                             style={{
-                              backgroundColor: colorDef.hex,
-                              color: colorDef.contrastText,
+                              backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
+                              color: isCompleted ? '#6b7280' : colorDef.contrastText,
+                              borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.1)',
+                              opacity: isCompleted ? 0.55 : 1,
                             }}
-                            className="text-[9px] sm:text-[11px] px-1 sm:px-2 py-0.5 rounded-md font-medium truncate cursor-pointer transition shadow-2xs hover:brightness-95 select-none border border-black/10"
+                            className={`text-[9px] sm:text-[11px] px-1 sm:px-2 py-0.5 rounded-md font-medium truncate cursor-pointer transition shadow-2xs select-none border ${
+                              isCompleted ? 'hover:opacity-85 line-through' : 'hover:brightness-95'
+                            }`}
                             title={`${ev.summary} (Cały dzień / >24h)`}
                           >
-                            <span className="mr-0.5 sm:mr-1">{isTask ? '✓' : '●'}</span>
-                            {ev.summary}
+                            <span className="mr-0.5 sm:mr-1">{isTask ? (isCompleted ? '✓' : '○') : '●'}</span>
+                            {cleanTaskTitle(ev.summary)}
                           </div>
                         );
                       })}
@@ -1870,14 +3029,15 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
             {/* 3. 24-Hour Scrollable Grid (00:00 to 24:00 - od północy do północy) */}
             <div
               ref={weekScrollRef}
-              className="overflow-y-auto flex-1 min-h-0 relative flex select-none divide-x divide-neutral-200 w-full"
+              className="overflow-y-auto flex-1 min-h-0 relative flex select-none divide-x divide-neutral-200 w-full calendar-scrollbar"
             >
               {/* Left Column: 24 Hour Labels (00:00 Północ to 23:00 + 24:00 Północ) */}
               <div className="w-10 sm:w-16 shrink-0 bg-neutral-50/70 border-r border-neutral-200 text-right pr-1 sm:pr-2">
                 {HOURS_24.map((hour) => (
                   <div
                     key={hour}
-                    className="h-[48px] border-b border-neutral-100 flex items-start justify-end pt-1"
+                    style={{ height: `${hourHeight}px` }}
+                    className="border-b border-neutral-100 flex items-start justify-end pt-1"
                   >
                     <span className="text-[8px] sm:text-[10px] font-medium text-neutral-400">
                       {String(hour).padStart(2, '0')}:00
@@ -1904,12 +3064,13 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                   const now = new Date();
                   const currentHour = now.getHours();
                   const currentMin = now.getMinutes();
-                  const currentTop = (currentHour * 60 + currentMin) * (48 / 60);
+                  const currentTop = (currentHour * 60 + currentMin) * (hourHeight / 60);
 
                   return (
                     <div
                       key={dateStr}
-                      className={`relative h-[1152px] min-w-0 ${
+                      style={{ height: `${24 * hourHeight}px` }}
+                      className={`relative min-w-0 ${
                         isToday ? 'bg-blue-50/15' : 'bg-white'
                       }`}
                     >
@@ -1929,9 +3090,17 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                         return (
                           <div
                             key={hour}
-                            onClick={() => handleOpenAddEvent(dateStr, timeStr)}
-                            className="h-[48px] border-b border-neutral-100 hover:bg-blue-50/40 cursor-pointer transition-colors group relative"
-                            title={`Kliknij, aby dodać wydarzenie o ${timeStr}`}
+                            style={{ height: `${hourHeight}px` }}
+                            onClick={() => {
+                              setSelectedMonthDateStr(dateStr);
+                              setCursorDate(new Date(dateStr + 'T12:00:00'));
+                            }}
+                            onDoubleClick={(e) => {
+                              e.stopPropagation();
+                              handleOpenAddEvent(dateStr, timeStr);
+                            }}
+                            className="border-b border-neutral-100 hover:bg-blue-50/40 cursor-pointer transition-colors group relative"
+                            title={`Podwójne kliknięcie: utwórz wydarzenie o ${timeStr}`}
                           >
                             <span className="absolute left-1 top-1 text-[8px] sm:text-[9px] font-medium text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none truncate max-w-full">
                               +{timeStr}
@@ -1942,12 +3111,14 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
                       {/* Timed Events positioned with overlap handling (shorter event takes half column if concurrent) */}
                       {(() => {
-                        const dayLayouts = computeDayTimedEventLayouts(timedEvents, 48, 1152);
+                        const dayLayouts = computeDayTimedEventLayouts(timedEvents, hourHeight, 24 * hourHeight);
                         return dayLayouts.map((item) => {
                           const ev = item.event;
                           const isTask = isCalendarTaskEvent(ev);
+                          const isCompleted = isTask && isTaskCompleted(ev);
                           const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
                           const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+                          const startStr = formatEventStartTime(ev);
 
                           return (
                             <div
@@ -1964,30 +3135,25 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                   item.widthPercent === 100
                                     ? 'calc(100% - 2px)'
                                     : `calc(${item.widthPercent}% - 2px)`,
-                                backgroundColor: colorDef.hex,
-                                color: colorDef.contrastText,
+                                backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
+                                color: isCompleted ? '#6b7280' : colorDef.contrastText,
+                                borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.12)',
+                                opacity: isCompleted ? 0.55 : 1,
+                                zIndex: item.zIndex ?? 10,
                               }}
-                              className="absolute rounded-md px-1 sm:px-2 py-0.5 sm:py-1 text-left shadow-2xs cursor-pointer z-10 overflow-hidden transition-all hover:z-30 hover:shadow-md hover:brightness-95 border border-black/10 select-none group min-w-0"
-                              title={`${ev.summary} (${formatEventTime(ev)})`}
+                              className={`absolute rounded-md px-1 sm:px-1.5 py-0.5 text-left shadow-2xs cursor-pointer overflow-hidden transition-all hover:z-40 hover:shadow-md border select-none group min-w-0 flex flex-col items-start justify-start ${
+                                isCompleted ? 'hover:opacity-85' : 'hover:brightness-95'
+                              }`}
+                              title={`${startStr ? `${startStr} ` : ''}${ev.summary}`}
                             >
-                              <div className="flex items-start justify-between gap-0.5 leading-tight">
-                                <span className="font-semibold text-[9px] sm:text-[11px] truncate">
-                                  {isEventRecurring(ev) ? '🔁 ' : isTask ? '✓ ' : ''}
-                                  {ev.summary}
+                              <div className="flex flex-col items-start justify-start text-left leading-tight w-full">
+                                <span className={`font-semibold text-[9px] sm:text-[11px] truncate w-full text-left ${isCompleted ? 'line-through opacity-75' : ''}`}>
+                                  {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                                  {cleanTaskTitle(ev.summary)}
                                 </span>
-                                {ev.calendarSummary && (
-                                  <span className="text-[7px] sm:text-[8px] px-1 py-0.2 rounded bg-black/20 text-white truncate max-w-[48px] shrink-0 font-normal hidden sm:inline">
-                                    {ev.calendarSummary}
-                                  </span>
-                                )}
                               </div>
-                              {item.heightPx >= 34 && (
-                                <div className="text-[8px] sm:text-[10px] opacity-90 truncate leading-tight mt-0.5 font-normal">
-                                  {formatEventTime(ev)}
-                                </div>
-                              )}
-                              {item.heightPx >= 52 && ev.location && (
-                                <div className="text-[8px] sm:text-[9px] opacity-85 truncate flex items-center gap-0.5 mt-0.5 hidden sm:flex">
+                              {item.heightPx >= 44 && ev.location && (
+                                <div className="text-[8px] sm:text-[9px] opacity-85 truncate flex items-center gap-0.5 mt-0.5 hidden sm:flex text-left">
                                   <MapPin className="w-2.5 h-2.5 shrink-0 opacity-75" />
                                   <span className="truncate">{ev.location}</span>
                                 </div>
@@ -2018,31 +3184,75 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
             <div className="grid grid-cols-7 grid-rows-4 gap-0.5 sm:gap-1 w-full flex-1 min-h-0 h-full p-1 bg-neutral-100/50 overflow-hidden">
               {fourWeeksDays.map(({ date, dateStr, isCurrentMonth }) => {
                 const isToday = dateStr === todayStr;
+                const isSelected = selectedMonthDateStr === dateStr;
                 const dayEvents = eventsByDate[dateStr] || [];
 
                 return (
                   <div
                     key={dateStr}
                     onClick={() => {
-                      setCursorDate(date);
+                      const now = Date.now();
+                      if (now - lastDoubleActionTimeRef.current < 700) {
+                        return;
+                      }
+                      setSelectedMonthDateStr(dateStr);
                     }}
-                    className={`h-full min-h-0 p-1 sm:p-1.5 rounded-lg border flex flex-col justify-start transition hover:border-blue-300 cursor-pointer min-w-0 overflow-hidden ${
-                      isToday
-                        ? 'border-blue-400 bg-blue-50/40 ring-1 ring-blue-400/40'
+                    onDoubleClick={(e) => {
+                      e.preventDefault();
+                      const now = Date.now();
+                      if (now - lastDoubleActionTimeRef.current < 700) {
+                        return;
+                      }
+                      lastDoubleActionTimeRef.current = now;
+                      lastTapRef.current = { dateStr: '', time: 0 };
+                      setCursorDate(date);
+                      setSelectedMonthDateStr(dateStr);
+                    }}
+                    onTouchEnd={(e) => {
+                      const now = Date.now();
+                      const prevTap = lastTapRef.current;
+                      if (
+                        prevTap.dateStr === dateStr &&
+                        now - prevTap.time < 450 &&
+                        now - prevTap.time > 40
+                      ) {
+                        if (e.cancelable) {
+                          e.preventDefault();
+                        }
+                        lastDoubleActionTimeRef.current = now;
+                        lastTapRef.current = { dateStr: '', time: 0 };
+                        setCursorDate(date);
+                        setSelectedMonthDateStr(dateStr);
+                      } else {
+                        lastTapRef.current = { dateStr, time: now };
+                      }
+                    }}
+                    title="Dwukrotne kliknięcie: ustaw ten dzień w pierwszym wyświetlanym tygodniu"
+                    className={`h-full min-h-0 p-1 sm:p-1.5 rounded-lg border flex flex-col justify-start transition cursor-pointer min-w-0 overflow-hidden relative touch-manipulation ${
+                      isSelected
+                        ? 'border-blue-600 ring-2 ring-blue-500/80 bg-blue-50/70 shadow-xs z-10'
+                        : isToday
+                        ? 'border-blue-400 bg-blue-50/40 ring-1 ring-blue-400/40 hover:border-blue-500'
                         : isCurrentMonth
-                        ? 'border-neutral-200 bg-white'
-                        : 'border-neutral-150 bg-neutral-50/50 opacity-70'
+                        ? 'border-neutral-200 bg-white hover:border-blue-300'
+                        : 'border-neutral-150 bg-neutral-50/50 opacity-70 hover:border-neutral-300'
                     }`}
                   >
                     <div className="flex items-center justify-between shrink-0 leading-none">
                       <span
-                        className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] sm:text-xs font-bold ${
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setCursorDate(date);
+                          handleSelectViewMode('dzien');
+                        }}
+                        className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] sm:text-xs font-bold cursor-pointer transition hover:scale-110 hover:ring-2 hover:ring-blue-400 ${
                           isToday
                             ? 'bg-blue-600 text-white'
                             : isCurrentMonth
-                            ? 'text-neutral-800'
-                            : 'text-neutral-400'
+                            ? 'text-neutral-800 hover:bg-neutral-200'
+                            : 'text-neutral-400 hover:bg-neutral-200'
                         }`}
+                        title="Kliknij, aby przejść do widoku dnia"
                       >
                         {date.getDate()}
                       </span>
@@ -2061,11 +3271,13 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                     </div>
 
                     {/* Events chips */}
-                    <div className="space-y-0.5 mt-0.5 flex-1 min-h-0 overflow-y-auto pr-0.5">
+                    <div className="space-y-0.5 mt-0.5 flex-1 min-h-0 overflow-y-auto pr-0.5 day-cell-scrollbar">
                       {dayEvents.map((event) => {
                         const isTask = isCalendarTaskEvent(event);
+                        const isCompleted = isTask && isTaskCompleted(event);
                         const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
                         const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
+                        const startStr = formatEventStartTime(event);
 
                         return (
                           <div
@@ -2075,18 +3287,24 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               setPreviewEvent(event);
                             }}
                             style={{
-                              backgroundColor: colorDef.bg,
-                              borderColor: colorDef.border,
-                              color: colorDef.text,
+                              backgroundColor: isCompleted ? '#f3f4f6' : colorDef.bg,
+                              borderColor: isCompleted ? '#e5e7eb' : colorDef.border,
+                              color: isCompleted ? '#6b7280' : colorDef.text,
+                              opacity: isCompleted ? 0.55 : 1,
                             }}
-                            className="px-1 sm:px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-medium truncate flex items-center space-x-0.5 sm:space-x-1 border shadow-2xs hover:brightness-95 select-none min-w-0"
-                            title={`${event.summary} (${formatEventTime(event)})`}
+                            className={`px-1 sm:px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-medium truncate flex items-center space-x-0.5 sm:space-x-1 border shadow-2xs select-none min-w-0 text-left ${
+                              isCompleted ? 'hover:opacity-85' : 'hover:brightness-95'
+                            }`}
+                            title={`${startStr ? `${startStr} ` : ''}${event.summary}`}
                           >
                             <span
                               className="w-1 h-1 sm:w-1.5 sm:h-1.5 rounded-full shrink-0"
                               style={{ backgroundColor: colorDef.hex }}
                             />
-                            <span className="truncate">{isEventRecurring(event) ? '🔁 ' : ''}{event.summary}</span>
+                            <span className={`truncate text-left ${isCompleted ? 'line-through opacity-75' : ''}`}>
+                              {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                              {event.summary}
+                            </span>
                           </div>
                         );
                       })}
@@ -2098,7 +3316,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
           </div>
         )}
 
-        {/* VIEW 5: Miesiąc (Month view) */}
+        {/* VIEW 5: Miesiąc (Month view - automatycznie dostosowuje wszystkie tygodnie na ekranie bez przewijania) */}
         {viewMode === 'miesiac' && (
           <div className="w-full h-full min-h-0 flex flex-col overflow-hidden">
             {/* Weekday Names Header */}
@@ -2111,61 +3329,88 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               ))}
             </div>
 
-            {/* Month Grid Cells */}
+            {/* Month Grid Cells: Wszystkie tygodnie w danym miesiącu mieszczą się na ekranie bez przewijania całego kalendarza */}
             <div
-              className="grid grid-cols-7 gap-0.5 sm:gap-1 w-full flex-1 min-h-0 h-full p-1 bg-neutral-100/50 overflow-hidden"
+              ref={monthScrollRef}
+              className="grid grid-cols-7 gap-0.5 sm:gap-1 w-full flex-1 min-h-0 overflow-hidden p-1 bg-neutral-100/50"
               style={{
-                gridTemplateRows: `repeat(${Math.ceil(monthGridDays.length / 7)}, minmax(0, 1fr))`,
+                gridTemplateRows: `repeat(${totalMonthWeeks}, minmax(0, 1fr))`,
               }}
             >
               {monthGridDays.map(({ date, dateStr, isCurrentMonth }) => {
                 const isToday = dateStr === todayStr;
+                const isSelected = selectedMonthDateStr === dateStr;
                 const dayEvents = eventsByDate[dateStr] || [];
 
                 return (
                   <div
                     key={dateStr}
-                    onClick={() => setCursorDate(date)}
-                    className={`h-full min-h-0 p-1 sm:p-1.5 rounded-lg border flex flex-col justify-start transition hover:border-blue-400 cursor-pointer min-w-0 overflow-hidden ${
-                      isToday
-                        ? 'border-blue-400 bg-blue-50/40 ring-1 ring-blue-400/40'
+                    onClick={() => handleSelectMonthDay(date, dateStr)}
+                    className={`h-full min-h-0 p-1 sm:p-1.5 rounded-lg border flex flex-col justify-start transition cursor-pointer min-w-0 overflow-hidden relative ${
+                      isSelected
+                        ? 'border-blue-600 ring-2 ring-blue-500/80 bg-blue-50/70 shadow-xs z-10'
+                        : isToday
+                        ? 'border-blue-400 bg-blue-50/30 ring-1 ring-blue-400/40 hover:border-blue-500'
                         : isCurrentMonth
-                        ? 'border-neutral-200 bg-white'
-                        : 'border-neutral-150 bg-neutral-50/50 opacity-60'
+                        ? 'border-neutral-200 bg-white hover:border-blue-300'
+                        : 'border-neutral-150 bg-neutral-50/50 opacity-60 hover:border-neutral-300'
                     }`}
                   >
                     <div className="flex items-center justify-between shrink-0 leading-none">
-                      <span
-                        className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] sm:text-xs font-bold ${
-                          isToday
-                            ? 'bg-blue-600 text-white'
-                            : isCurrentMonth
-                            ? 'text-neutral-800'
-                            : 'text-neutral-400'
-                        }`}
-                      >
-                        {date.getDate()}
-                      </span>
+                      <div className="flex items-center space-x-1">
+                        <span
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setCursorDate(date);
+                            handleSelectViewMode('dzien');
+                          }}
+                          className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] sm:text-xs font-bold cursor-pointer transition hover:scale-110 hover:ring-2 hover:ring-blue-400 ${
+                            isSelected
+                              ? 'bg-blue-600 text-white shadow-xs ring-1 ring-blue-700'
+                              : isToday
+                              ? 'bg-blue-600 text-white'
+                              : isCurrentMonth
+                              ? 'text-neutral-800 hover:bg-neutral-200'
+                              : 'text-neutral-400 hover:bg-neutral-200'
+                          }`}
+                          title="Kliknij, aby przejść do widoku dnia"
+                        >
+                          {date.getDate()}
+                        </span>
+                        {isSelected && (
+                          <span className="hidden xl:inline-block text-[8px] sm:text-[9px] font-bold text-blue-700 bg-blue-100/90 px-1 py-0.2 rounded leading-none">
+                            Wybrany
+                          </span>
+                        )}
+                      </div>
 
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
+                          handleSelectMonthDay(date, dateStr);
                           handleOpenAddEvent(dateStr);
                         }}
-                        className="text-[9px] sm:text-xs text-neutral-400 hover:text-blue-600 p-0.5 hover:bg-neutral-100 rounded cursor-pointer leading-none"
-                        title="Dodaj wydarzenie w tym dniu"
+                        className={`text-[9px] sm:text-xs p-0.5 rounded cursor-pointer leading-none flex items-center space-x-0.5 transition ${
+                          isSelected
+                            ? 'text-blue-700 bg-blue-100 hover:bg-blue-200 font-bold px-1.5 py-0.5 shadow-2xs'
+                            : 'text-neutral-400 hover:text-blue-600 hover:bg-neutral-100'
+                        }`}
+                        title={`Utwórz wydarzenie w tym dniu (${dateStr})`}
                       >
-                        +
+                        <Plus className="w-3 h-3" />
+                        {isSelected && <span className="hidden md:inline text-[9px] sm:text-[10px] font-semibold">Utwórz</span>}
                       </button>
                     </div>
 
-                    {/* Events chips list */}
-                    <div className="space-y-0.5 mt-0.5 flex-1 min-h-0 overflow-y-auto pr-0.5">
+                    {/* Events chips list (przewijanie wewnątrz dnia, jeśli wydarzeń jest więcej) */}
+                    <div className="space-y-0.5 mt-0.5 flex-1 min-h-0 overflow-y-auto pr-0.5 day-cell-scrollbar">
                       {dayEvents.map((event) => {
                         const isTask = isCalendarTaskEvent(event);
+                        const isCompleted = isTask && isTaskCompleted(event);
                         const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
                         const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
+                        const startStr = formatEventStartTime(event);
 
                         return (
                           <div
@@ -2175,18 +3420,24 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               setPreviewEvent(event);
                             }}
                             style={{
-                              backgroundColor: colorDef.bg,
-                              borderColor: colorDef.border,
-                              color: colorDef.text,
+                              backgroundColor: isCompleted ? '#f3f4f6' : colorDef.bg,
+                              borderColor: isCompleted ? '#e5e7eb' : colorDef.border,
+                              color: isCompleted ? '#6b7280' : colorDef.text,
+                              opacity: isCompleted ? 0.55 : 1,
                             }}
-                            className="px-1 sm:px-1.5 py-0.5 rounded text-[8px] sm:text-[11px] font-medium truncate flex items-center space-x-0.5 sm:space-x-1 cursor-pointer border shadow-2xs hover:brightness-95 select-none min-w-0"
-                            title={`${event.summary} (${formatEventTime(event)})`}
+                            className={`px-1 sm:px-1.5 py-0.5 rounded text-[8px] sm:text-[11px] font-medium truncate flex items-center space-x-0.5 sm:space-x-1 cursor-pointer border shadow-2xs select-none min-w-0 text-left ${
+                              isCompleted ? 'hover:opacity-85' : 'hover:brightness-95'
+                            }`}
+                            title={`${startStr ? `${startStr} ` : ''}${event.summary}`}
                           >
                             <span
                               className="w-1 h-1 sm:w-1.5 sm:h-1.5 rounded-full shrink-0"
                               style={{ backgroundColor: colorDef.hex }}
                             />
-                            <span className="truncate">{isEventRecurring(event) ? '🔁 ' : ''}{event.summary}</span>
+                            <span className={`truncate text-left ${isCompleted ? 'line-through opacity-75' : ''}`}>
+                              {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                              {event.summary}
+                            </span>
                           </div>
                         );
                       })}
@@ -2195,8 +3446,55 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                 );
               })}
             </div>
+
+            {/* Pasek akcji wybranego dnia w widoku miesiąca */}
+            {selectedMonthDateStr && (
+              <div className="shrink-0 mt-1 px-3 py-1.5 bg-white border-t border-neutral-200 rounded-b-xl flex flex-wrap items-center justify-between gap-2 shadow-xs">
+                <div className="flex items-center space-x-2">
+                  <span className="w-2 h-2 rounded-full bg-blue-600 animate-pulse" />
+                  <span className="text-xs font-bold text-neutral-800">
+                    Zaznaczony dzień:
+                  </span>
+                  <span className="text-xs font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md border border-blue-200">
+                    {(() => {
+                      const [y, m, d] = selectedMonthDateStr.split('-').map(Number);
+                      const dt = new Date(y, m - 1, d);
+                      const dayName = DAY_NAMES_PL[dt.getDay() === 0 ? 6 : dt.getDay() - 1];
+                      return `${dayName}, ${d} ${MONTH_NAMES_GENITIVE_PL[m - 1]} ${y}`;
+                    })()}
+                  </span>
+                </div>
+
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    id="btn-month-selected-day-create-event"
+                    onClick={() => handleOpenAddEvent(selectedMonthDateStr)}
+                    className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+                    title={`Utwórz wydarzenie na zaznaczony dzień (${selectedMonthDateStr})`}
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Utwórz wydarzenie</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const [y, m, d] = selectedMonthDateStr.split('-').map(Number);
+                      setCursorDate(new Date(y, m - 1, d));
+                      handleSelectViewMode('dzien');
+                    }}
+                    className="inline-flex items-center space-x-1 px-2.5 py-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded-lg text-xs font-medium transition cursor-pointer"
+                    title="Przejdź do widoku dnia"
+                  >
+                    <span>Widok dnia</span>
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
+          </div>
         </div>
       </div>
 
@@ -2207,9 +3505,15 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
         const colorDef = getGoogleEventColor(previewEvent, isTask, fallbackColor);
 
         return (
-          <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
-            <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95">
-              <div className="flex items-start justify-between pb-3 border-b border-neutral-100">
+          <div
+            className="fixed inset-0 bg-black/50 backdrop-blur-2xs z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+            onClick={() => setPreviewEvent(null)}
+          >
+            <div
+              className="bg-white rounded-2xl max-w-md w-full p-4 sm:p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 max-h-[calc(100dvh-2rem)] sm:max-h-[90vh] flex flex-col my-auto overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-start justify-between pb-3 border-b border-neutral-100 shrink-0">
                 <div className="flex items-center space-x-2.5">
                   <div
                     className="w-9 h-9 rounded-xl flex items-center justify-center shadow-2xs shrink-0"
@@ -2245,7 +3549,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                 </button>
               </div>
 
-              <div className="py-4 space-y-3 text-xs text-neutral-700">
+              <div className="py-3 sm:py-4 space-y-3 text-xs text-neutral-700 overflow-y-auto flex-1 min-h-0 pr-1 calendar-scrollbar">
                 <div className="flex items-start space-x-2.5">
                   <Clock className="w-4 h-4 text-neutral-400 shrink-0 mt-0.5" />
                   <div>
@@ -2290,14 +3594,14 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                 )}
               </div>
 
-              <div className="flex items-center justify-between pt-3 border-t border-neutral-100">
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-neutral-100 shrink-0">
                 {previewEvent.id.startsWith('gtask-') ? (
                   (() => {
                     const rawId = previewEvent.recurringEventId || previewEvent.id;
                     const taskId = rawId.replace('gtask-', '').split('__rec__')[0];
                     const currentTask = tasks?.find((t) => t.id === taskId);
                     return (
-                      <div className="flex items-center space-x-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         {currentTask && onToggleTask && (
                           <button
                             type="button"
@@ -2321,6 +3625,22 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                 ? 'Oznacz jako do zrobienia'
                                 : 'Oznacz jako ukończone'}
                             </span>
+                          </button>
+                        )}
+                        {currentTask && onDeleteTask && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (confirm(`Czy na pewno chcesz usunąć zadanie "${cleanTaskTitle(currentTask.title)}"?`)) {
+                                setPreviewEvent(null);
+                                await onDeleteTask(currentTask);
+                              }
+                            }}
+                            className="inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-rose-700 hover:bg-rose-50 border border-rose-200 transition cursor-pointer"
+                            title="Usuń to zadanie"
+                          >
+                            <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                            <span>Usuń zadanie</span>
                           </button>
                         )}
                         <span className="text-[11px] font-medium text-neutral-500">
@@ -2352,6 +3672,29 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                   >
                     Zamknij
                   </button>
+
+                  {/* Opcja edycji Zadania z poziomu Kalendarza */}
+                  {previewEvent.id.startsWith('gtask-') && onUpdateTask && (() => {
+                    const rawId = previewEvent.recurringEventId || previewEvent.id;
+                    const taskId = rawId.replace('gtask-', '').split('__rec__')[0];
+                    const currentTask = tasks?.find((t) => t.id === taskId);
+                    if (!currentTask) return null;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPreviewEvent(null);
+                          handleOpenEditTaskFromCalendar(currentTask);
+                        }}
+                        className="px-3.5 py-1.5 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 transition shadow-2xs cursor-pointer inline-flex items-center space-x-1.5"
+                        title="Edytuj to zadanie z poziomu kalendarza"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                        <span>Edytuj zadanie</span>
+                      </button>
+                    );
+                  })()}
+
                   {!previewEvent.id.startsWith('gtask-') && onCreateCalendarEvent && (
                     <button
                       type="button"
@@ -2389,15 +3732,21 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
       {/* Add / Edit Calendar Event Modal */}
       {showEventModal && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-4 sm:p-6 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150 my-8">
-            <div className="flex items-center justify-between pb-3 border-b border-neutral-100">
+        <div
+          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-2 sm:p-4 overflow-y-auto"
+          onClick={() => setShowEventModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-lg w-full p-3.5 sm:p-6 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150 my-auto max-h-[calc(100dvh-1rem)] sm:max-h-[92vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-2.5 sm:pb-3 border-b border-neutral-100 shrink-0">
               <div className="flex items-center space-x-2.5">
-                <div className="w-9 h-9 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center">
+                <div className="w-9 h-9 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
                   <CalendarIcon className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-neutral-900">
+                  <h3 className="text-base font-bold text-neutral-900 leading-snug">
                     {editingEvent ? 'Edytuj wydarzenie w kalendarzu' : 'Nowe wydarzenie w kalendarzu'}
                   </h3>
                   <p className="text-xs text-neutral-500">
@@ -2408,211 +3757,211 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               <button
                 type="button"
                 onClick={() => setShowEventModal(false)}
-                className="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 transition-colors cursor-pointer"
+                className="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 transition-colors cursor-pointer shrink-0"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
             {eventModalError && (
-              <div className="mt-3 p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-start space-x-2">
+              <div className="mt-2.5 sm:mt-3 p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-start space-x-2 shrink-0">
                 <AlertCircle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
                 <span>{eventModalError}</span>
               </div>
             )}
 
-            <form onSubmit={handleSaveEventSubmit} className="space-y-3.5 mt-4">
-              <div>
-                <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                  Kalendarz Google *
-                </label>
-                <select
-                  value={eventCalendarId}
-                  onChange={(e) => setEventCalendarId(e.target.value)}
-                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
-                >
-                  {calendars
-                    .filter((c) => c.id !== ALL_CALENDARS_ID)
-                    .map((cal) => (
-                      <option key={cal.id} value={cal.id}>
-                        {cal.summary
-                          ?.replace(/\s*[([](?:główny|glowny|primary)[)\]]/gi, '')
-                          ?.replace(/\s*-\s*(?:główny|glowny|primary)/gi, '')
-                          ?.trim() || cal.summary}
-                      </option>
-                    ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                  Nazwa wydarzenia *
-                </label>
-                <input
-                  type="text"
-                  value={eventSummary}
-                  onChange={(e) => setEventSummary(e.target.value)}
-                  placeholder="np. Spotkanie projektowe, Warsztaty, Konferencja"
-                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                  required
-                />
-              </div>
-
-              {/* All-day toggle */}
-              <div className="flex items-center justify-between p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
-                <span className="text-xs font-medium text-neutral-700">Wydarzenie całodniowe</span>
-                <input
-                  type="checkbox"
-                  checked={eventIsAllDay}
-                  onChange={(e) => setEventIsAllDay(e.target.checked)}
-                  className="w-4 h-4 text-blue-600 rounded border-neutral-300 focus:ring-blue-500 cursor-pointer"
-                />
-              </div>
-
-              {/* Dates and Times */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <form onSubmit={handleSaveEventSubmit} className="flex-1 min-h-0 flex flex-col mt-2.5 sm:mt-3">
+              <div className="overflow-y-auto min-h-0 flex-1 pr-1 sm:pr-1.5 space-y-3 sm:space-y-3.5">
                 <div>
-                  <label className="block text-[11px] font-medium text-neutral-600 mb-1">
-                    Data rozpoczęcia *
+                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                    Kalendarz Google *
                   </label>
-                  <input
-                    type="date"
-                    value={eventStartDate}
-                    onChange={(e) => {
-                      setEventStartDate(e.target.value);
-                      if (eventEndDate && e.target.value > eventEndDate) {
-                        setEventEndDate(e.target.value);
-                      }
-                    }}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
-                    required
-                  />
-                  {!eventIsAllDay && (
-                    <div className="mt-2">
-                      <label className="block text-[10px] text-neutral-500 mb-1">Godzina rozpoczęcia</label>
-                      <input
-                        type="time"
-                        value={eventStartTime}
-                        onChange={(e) => handleStartTimeChange(e.target.value)}
-                        className="w-full text-xs border border-neutral-300 rounded-lg p-1.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
-                      />
-                    </div>
-                  )}
+                  <select
+                    value={eventCalendarId}
+                    onChange={(e) => setEventCalendarId(e.target.value)}
+                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
+                  >
+                    {calendars
+                      .filter((c) => c.id !== ALL_CALENDARS_ID)
+                      .map((cal) => (
+                        <option key={cal.id} value={cal.id}>
+                          {cal.summary
+                            ?.replace(/\s*[([](?:główny|glowny|primary)[)\]]/gi, '')
+                            ?.replace(/\s*-\s*(?:główny|glowny|primary)/gi, '')
+                            ?.trim() || cal.summary}
+                        </option>
+                      ))}
+                  </select>
                 </div>
 
                 <div>
-                  <label className="block text-[11px] font-medium text-neutral-600 mb-1">
-                    Data zakończenia (powrót)
+                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                    Nazwa wydarzenia *
                   </label>
-                  <input
-                    type="date"
-                    value={eventEndDate}
-                    min={eventStartDate}
-                    onChange={(e) => setEventEndDate(e.target.value)}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
-                  />
-                  {!eventIsAllDay && (
-                    <div className="mt-2">
-                      <label className="block text-[10px] text-neutral-500 mb-1">Godzina zakończenia</label>
-                      <input
-                        type="time"
-                        value={eventEndTime}
-                        onChange={(e) => setEventEndTime(e.target.value)}
-                        className="w-full text-xs border border-neutral-300 rounded-lg p-1.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
-                      />
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                  Lokalizacja (opcjonalnie)
-                </label>
-                <div className="relative">
-                  <MapPin className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-3 pointer-events-none" />
                   <input
                     type="text"
-                    value={eventLocation}
-                    onChange={(e) => setEventLocation(e.target.value)}
-                    placeholder="np. Rzym, Włochy / Hotel Colosseo"
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg pl-8 p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    value={eventSummary}
+                    onChange={(e) => setEventSummary(e.target.value)}
+                    placeholder="np. Spotkanie projektowe, Warsztaty, Konferencja"
+                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    required
                   />
                 </div>
-              </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                  Opis / Notatki (opcjonalnie)
-                </label>
-                <textarea
-                  value={eventDescription}
-                  onChange={(e) => setEventDescription(e.target.value)}
-                  placeholder="Dodatkowe informacje, nr lotu, potwierdzenie..."
-                  rows={2}
-                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                />
-              </div>
+                {/* All-day toggle */}
+                <div className="flex items-center justify-between p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
+                  <span className="text-xs font-medium text-neutral-700">Wydarzenie całodniowe</span>
+                  <input
+                    type="checkbox"
+                    checked={eventIsAllDay}
+                    onChange={(e) => setEventIsAllDay(e.target.checked)}
+                    className="w-4 h-4 text-blue-600 rounded border-neutral-300 focus:ring-blue-500 cursor-pointer"
+                  />
+                </div>
 
-              {/* Google Calendar Event Color Picker */}
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="text-xs font-semibold text-neutral-700">
-                    Kolor w Kalendarzu Google
+                {/* Dates and Times */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-medium text-neutral-600 mb-1">
+                      Data rozpoczęcia *
+                    </label>
+                    <input
+                      type="date"
+                      value={eventStartDate}
+                      onChange={(e) => {
+                        setEventStartDate(e.target.value);
+                        if (eventEndDate && e.target.value > eventEndDate) {
+                          setEventEndDate(e.target.value);
+                        }
+                      }}
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
+                      required
+                    />
+                    {!eventIsAllDay && (
+                      <div className="mt-2">
+                        <AndroidTimePickerField
+                          label="Godzina rozpoczęcia"
+                          value={eventStartTime}
+                          onChange={(newTime) => handleStartTimeChange(newTime)}
+                          title="Godzina rozpoczęcia wydarzenia"
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-neutral-600 mb-1">
+                      Data zakończenia (powrót)
+                    </label>
+                    <input
+                      type="date"
+                      value={eventEndDate}
+                      min={eventStartDate}
+                      onChange={(e) => setEventEndDate(e.target.value)}
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
+                    />
+                    {!eventIsAllDay && (
+                      <div className="mt-2">
+                        <AndroidTimePickerField
+                          label="Godzina zakończenia"
+                          value={eventEndTime}
+                          onChange={(newTime) => setEventEndTime(newTime)}
+                          title="Godzina zakończenia wydarzenia"
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                    Lokalizacja (opcjonalnie)
                   </label>
-                  <span className="text-[11px] font-medium text-neutral-500">
-                    {GOOGLE_EVENT_COLOR_OPTIONS.find((c) => c.id === eventColorId)?.name || 'Domyślny kolor kalendarza'}
-                  </span>
+                  <div className="relative">
+                    <MapPin className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-3 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={eventLocation}
+                      onChange={(e) => setEventLocation(e.target.value)}
+                      placeholder="np. Rzym, Włochy / Hotel Colosseo"
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg pl-8 p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    />
+                  </div>
                 </div>
-                <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
-                  <button
-                    type="button"
-                    onClick={() => setEventColorId('')}
-                    className={`px-2.5 py-1 text-xs rounded-lg border transition-all cursor-pointer ${
-                      !eventColorId
-                        ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
-                        : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
-                    }`}
-                    title="Użyj domyślnego koloru kalendarza"
-                  >
-                    Domyślny
-                  </button>
-                  {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
-                    const isSelected = (eventColorId || '') === col.id;
-                    return (
-                      <button
-                        key={col.id}
-                        type="button"
-                        onClick={() => setEventColorId(col.id)}
-                        className={`w-7 h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
-                          isSelected
-                            ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
-                            : 'hover:scale-105 opacity-90 hover:opacity-100'
-                        }`}
-                        style={{ backgroundColor: col.hex }}
-                        title={`${col.name} (Google ID: ${col.id})`}
-                      >
-                        {isSelected && (
-                          <span
-                            className="text-xs font-black leading-none"
-                            style={{ color: col.contrastText }}
-                          >
-                            ✓
-                          </span>
-                        )}
-                      </button>
-                    );
-                  })}
+
+                <div>
+                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                    Opis / Notatki (opcjonalnie)
+                  </label>
+                  <textarea
+                    value={eventDescription}
+                    onChange={(e) => setEventDescription(e.target.value)}
+                    placeholder="Dodatkowe informacje, nr lotu, potwierdzenie..."
+                    rows={2}
+                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  />
+                </div>
+
+                {/* Google Calendar Event Color Picker */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-semibold text-neutral-700">
+                      Kolor w Kalendarzu Google
+                    </label>
+                    <span className="text-[11px] font-medium text-neutral-500">
+                      {GOOGLE_EVENT_COLOR_OPTIONS.find((c) => c.id === eventColorId)?.name || 'Domyślny kolor kalendarza'}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
+                    <button
+                      type="button"
+                      onClick={() => setEventColorId('')}
+                      className={`px-2.5 py-1 text-xs rounded-lg border transition-all cursor-pointer ${
+                        !eventColorId
+                          ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
+                          : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
+                      }`}
+                      title="Użyj domyślnego koloru kalendarza"
+                    >
+                      Domyślny
+                    </button>
+                    {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
+                      const isSelected = (eventColorId || '') === col.id;
+                      return (
+                        <button
+                          key={col.id}
+                          type="button"
+                          onClick={() => setEventColorId(col.id)}
+                          className={`w-7 h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
+                            isSelected
+                              ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
+                              : 'hover:scale-105 opacity-90 hover:opacity-100'
+                          }`}
+                          style={{ backgroundColor: col.hex }}
+                          title={`${col.name} (Google ID: ${col.id})`}
+                        >
+                          {isSelected && (
+                            <span
+                              className="text-xs font-black leading-none"
+                              style={{ color: col.contrastText }}
+                            >
+                              ✓
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-neutral-100">
+              <div className="shrink-0 pt-3 border-t border-neutral-100 mt-2 bg-white flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center space-x-2">
                   <button
                     type="button"
                     onClick={handleSaveAndGenerateTasks}
                     disabled={isSavingEvent}
-                    className="inline-flex items-center space-x-1.5 px-3.5 py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg shadow-2xs transition disabled:opacity-50 cursor-pointer"
+                    className="inline-flex items-center space-x-1.5 px-3 py-1.5 sm:px-3.5 sm:py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg shadow-2xs transition disabled:opacity-50 cursor-pointer"
                     title="Zapisz to wydarzenie i wygeneruj dla niego zadania"
                   >
                     <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
@@ -2624,11 +3973,11 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                       type="button"
                       onClick={() => setEventToDelete(editingEvent)}
                       disabled={isSavingEvent}
-                      className="inline-flex items-center space-x-1.5 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-lg transition disabled:opacity-50 cursor-pointer"
+                      className="inline-flex items-center space-x-1.5 px-3 py-1.5 sm:px-3.5 sm:py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-lg transition disabled:opacity-50 cursor-pointer"
                       title="Usuń to wydarzenie z kalendarza"
                     >
                       <Trash2 className="w-3.5 h-3.5 text-rose-600" />
-                      <span>Usuń wydarzenie</span>
+                      <span>Usuń</span>
                     </button>
                   )}
                 </div>
@@ -2638,22 +3987,22 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                     type="button"
                     onClick={() => setShowEventModal(false)}
                     disabled={isSavingEvent}
-                    className="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-colors cursor-pointer"
+                    className="px-3.5 py-1.5 sm:px-4 sm:py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-colors cursor-pointer"
                   >
                     Anuluj
                   </button>
                   <button
                     type="submit"
                     disabled={isSavingEvent}
-                    className="inline-flex items-center space-x-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+                    className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 sm:px-4 sm:py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
                   >
                     {isSavingEvent ? (
                       <>
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Zapisywanie w kalendarzu...</span>
+                        <span>Zapisywanie...</span>
                       </>
                     ) : (
-                      <span>{editingEvent ? 'Zapisz zmiany w kalendarzu' : 'Dodaj do Kalendarza Google'}</span>
+                      <span>{editingEvent ? 'Zapisz zmiany' : 'Dodaj do kalendarza'}</span>
                     )}
                   </button>
                 </div>
@@ -2663,10 +4012,136 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
         </div>
       )}
 
+      {/* Modal edycji Zadania z poziomu Kalendarza */}
+      {editingTask && (
+        <div
+          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-2 sm:p-4 overflow-y-auto"
+          onClick={() => setEditingTask(null)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-lg w-full p-4 sm:p-6 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150 my-auto max-h-[calc(100dvh-1rem)] sm:max-h-[92vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 mb-3 border-b border-neutral-100 shrink-0">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                  <Pencil className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-neutral-900">Edytuj zadanie</h3>
+                  <p className="text-xs text-neutral-500">Dostosuj nazwę, termin oraz czas trwania zadania w kalendarzu</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingTask(null)}
+                className="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditTaskFromCalendar} className="space-y-3.5 overflow-y-auto flex-1 pr-0.5">
+              {/* Wybór listy zadań */}
+              {taskLists && taskLists.length > 0 && (
+                <div>
+                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                    Lista zadań Google
+                  </label>
+                  <select
+                    value={editTaskTargetListId}
+                    onChange={(e) => setEditTaskTargetListId(e.target.value)}
+                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900 font-medium"
+                  >
+                    {taskLists
+                      .filter((tl) => tl.id !== ALL_TASK_LISTS_ID)
+                      .map((tl) => (
+                        <option key={tl.id} value={tl.id}>
+                          {tl.title}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              )}
+
+              {/* Nazwa zadania */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                  Nazwa zadania *
+                </label>
+                <input
+                  type="text"
+                  value={editTaskTitle}
+                  onChange={(e) => setEditTaskTitle(e.target.value)}
+                  placeholder="np. Pakowanie, Wyrzucić śmieci..."
+                  required
+                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900"
+                />
+              </div>
+
+              {/* Termin wykonania */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-neutral-700">
+                    Termin wykonania (data)
+                  </label>
+                  {editTaskDue && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditTaskDue('');
+                        setEditTaskAlsoCalendar(false);
+                      }}
+                      className="text-[10px] text-neutral-400 hover:text-rose-600 transition cursor-pointer"
+                    >
+                      Usuń termin
+                    </button>
+                  )}
+                </div>
+                <input
+                  type="date"
+                  value={editTaskDue}
+                  onChange={(e) => setEditTaskDue(e.target.value)}
+                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-neutral-100 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setEditingTask(null)}
+                  disabled={isSavingTaskEdit}
+                  className="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg cursor-pointer"
+                >
+                  Anuluj
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingTaskEdit || !editTaskTitle.trim()}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg shadow-xs disabled:opacity-50 flex items-center space-x-1.5 cursor-pointer"
+                >
+                  {isSavingTaskEdit && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{isSavingTaskEdit ? 'Zapisywanie...' : 'Zapisz zadanie'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* In-app Event Deletion Confirmation Modal */}
       {eventToDelete && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150">
+        <div
+          className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+          onClick={() => {
+            setEventToDelete(null);
+            setDeleteError(null);
+          }}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-start space-x-3">
               <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
                 <Trash2 className="w-5 h-5" />

@@ -30,7 +30,7 @@ import {
   formatTaskTitleWithTime,
 } from '../services/templateStorage';
 import { ALL_TASK_LISTS_ID, ALL_TASK_LISTS_ITEM } from '../services/googleTasksApi';
-import { ALL_CALENDARS_ID } from '../services/googleCalendarApi';
+import { ALL_CALENDARS_ID, findPrimaryCalendar } from '../services/googleCalendarApi';
 import { ChecklistPopover, ChecklistOption } from './ChecklistPopover';
 import { DateRangeFilterBar } from './DateRangeFilterBar';
 import {
@@ -38,7 +38,12 @@ import {
   getDefaultDateRange,
   getDashboardTasksDefaultDateRange,
   filterGoogleTasks,
+  getTodayDateString,
+  extractLocalDateStr,
+  DATE_PRESET_LABELS,
+  calculatePresetDates,
 } from '../utils/dateFilterUtils';
+import { AndroidTimePickerField } from './AndroidTimePicker';
 import { GOOGLE_EVENT_COLORS, GOOGLE_EVENT_COLOR_OPTIONS } from '../utils/googleCalendarColors';
 
 interface TasksListCardProps {
@@ -62,10 +67,17 @@ interface TasksListCardProps {
     targetTaskListId?: string,
     sourceTaskListId?: string
   ) => Promise<void>;
-  onAddTaskToCalendar?: (task: GoogleTaskItem, startTime?: string, colorId?: string) => Promise<void>;
+  onAddTaskToCalendar?: (
+    task: GoogleTaskItem,
+    startTime?: string,
+    colorId?: string,
+    targetCalendarId?: string,
+    isAllDay?: boolean
+  ) => Promise<void>;
   templates?: TaskTemplateItem[];
   onClearAllNotes?: () => Promise<void>;
   onRemoveHoursFromTitles?: () => Promise<void>;
+  onCleanHoursAndNotes?: () => Promise<void>;
   onSyncTasksToCalendar?: (targetCalendarId?: string, sourceTaskListId?: string) => Promise<void>;
   calendars?: GoogleCalendarItem[];
   includeTimeInTitle?: boolean;
@@ -81,6 +93,9 @@ interface TasksListCardProps {
   onBackToDashboard?: () => void;
   isSidebarOpen?: boolean;
   onCloseSidebar?: () => void;
+  onToggleSidebar?: () => void;
+  showControls?: boolean;
+  onToggleControls?: () => void;
 }
 
 export const TasksListCard: React.FC<TasksListCardProps> = ({
@@ -103,9 +118,10 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
   templates = [],
   onClearAllNotes,
   onRemoveHoursFromTitles,
+  onCleanHoursAndNotes,
   onSyncTasksToCalendar,
   calendars = [],
-  includeTimeInTitle = true,
+  includeTimeInTitle = false,
   onToggleIncludeTimeInTitle,
   onAddHoursToTasks,
   tasksPermissionError,
@@ -118,10 +134,38 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
   onBackToDashboard,
   isSidebarOpen = false,
   onCloseSidebar,
+  onToggleSidebar,
+  showControls,
+  onToggleControls,
 }) => {
+  const [internalShowControls, setInternalShowControls] = useState(false);
+  const isControlsOpen = showControls !== undefined ? showControls : internalShowControls;
+  const toggleControls = onToggleControls || (() => setInternalShowControls((prev) => !prev));
   const [filter, setFilter] = useState<'all' | 'active' | 'completed'>('all');
+
+  // Tasks controls dropdown menu ('...' button to the left of task list name)
+  const [showTasksControlsMenu, setShowTasksControlsMenu] = useState(false);
+  const tasksControlsDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node;
+      if (tasksControlsDropdownRef.current && !tasksControlsDropdownRef.current.contains(target)) {
+        setShowTasksControlsMenu(false);
+      }
+    };
+    if (showTasksControlsMenu) {
+      document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('touchstart', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('touchstart', handleClickOutside);
+    };
+  }, [showTasksControlsMenu]);
   const [newTaskTitle, setNewTaskTitle] = useState('');
-  const [newTaskDue, setNewTaskDue] = useState('');
+  const [newTaskDue, setNewTaskDue] = useState(getTodayDateString);
+  const [newTaskHasTime, setNewTaskHasTime] = useState(false);
   const [newTaskTime, setNewTaskTime] = useState('');
   const [newTaskNotes, setNewTaskNotes] = useState('');
   const [newTaskAlsoCalendar, setNewTaskAlsoCalendar] = useState(false);
@@ -140,32 +184,42 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
       }
     }
   }, [taskList, taskLists]);
+
+  const handleOpenNewTaskModal = () => {
+    setNewTaskTitle('');
+    setNewTaskDue(getTodayDateString());
+    setNewTaskHasTime(false);
+    setNewTaskTime('');
+    setNewTaskNotes('');
+    setNewTaskAlsoCalendar(false);
+    setNewTaskColorId('');
+    const defaultCalId =
+      findPrimaryCalendar(calendars)?.id ||
+      calendars.find((c) => c.id !== ALL_CALENDARS_ID)?.id ||
+      'primary';
+    setNewTaskTargetCalendarId(defaultCalId);
+    setShowNewTaskModal(true);
+  };
+
+  // Keyboard shortcut listener (m / t -> nowe zadanie)
+  useEffect(() => {
+    const handleTriggerNewTask = () => {
+      handleOpenNewTaskModal();
+    };
+    window.addEventListener('app:open-new-task', handleTriggerNewTask);
+    return () => window.removeEventListener('app:open-new-task', handleTriggerNewTask);
+  }, [calendars]);
   const [togglingTaskId, setTogglingTaskId] = useState<string | null>(null);
   const [isCleaningNotes, setIsCleaningNotes] = useState(false);
   const [isRemovingHours, setIsRemovingHours] = useState(false);
   const [isAddingHours, setIsAddingHours] = useState(false);
   const [isSyncingCalendar, setIsSyncingCalendar] = useState(false);
-  const [showCalendarDropdown, setShowCalendarDropdown] = useState(false);
-  const calendarDropdownRef = useRef<HTMLDivElement>(null);
+  const [showSyncModal, setShowSyncModal] = useState(false);
   const [syncSourceListId, setSyncSourceListId] = useState<string>('');
   const [syncTargetCalendarId, setSyncTargetCalendarId] = useState<string>('');
   const [showNewListModal, setShowNewListModal] = useState(false);
   const [newListName, setNewListName] = useState('');
   const [isCreatingList, setIsCreatingList] = useState(false);
-
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (calendarDropdownRef.current && !calendarDropdownRef.current.contains(e.target as Node)) {
-        setShowCalendarDropdown(false);
-      }
-    };
-    if (showCalendarDropdown) {
-      document.addEventListener('mousedown', handleClickOutside);
-    }
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-    };
-  }, [showCalendarDropdown]);
 
   // Active tasks for the selected source list in "Do Kalendarza"
   const selectedSourceListTasks = useMemo(() => {
@@ -177,19 +231,17 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
     return activeTasks.filter((t) => t.taskListId === syncSourceListId);
   }, [tasks, syncSourceListId]);
 
-  const handleOpenSyncDropdown = () => {
-    if (!showCalendarDropdown) {
-      if (!syncSourceListId) {
-        const validLists = taskLists.filter((l) => l.id !== ALL_TASK_LISTS_ID);
-        const defaultListId = taskList?.id && taskList.id !== ALL_TASK_LISTS_ID ? taskList.id : (validLists[0]?.id || ALL_TASK_LISTS_ID);
-        setSyncSourceListId(defaultListId);
-      }
-      if (!syncTargetCalendarId && calendars && calendars.length > 0) {
-        const primaryCal = calendars.find((c) => c.primary && c.id !== '_all_calendars_') || calendars.find((c) => c.id !== '_all_calendars_');
-        if (primaryCal) setSyncTargetCalendarId(primaryCal.id);
-      }
+  const handleOpenSyncModal = () => {
+    if (!syncSourceListId) {
+      const validLists = taskLists.filter((l) => l.id !== ALL_TASK_LISTS_ID);
+      const defaultListId = taskList?.id && taskList.id !== ALL_TASK_LISTS_ID ? taskList.id : (validLists[0]?.id || ALL_TASK_LISTS_ID);
+      setSyncSourceListId(defaultListId);
     }
-    setShowCalendarDropdown((prev) => !prev);
+    if (!syncTargetCalendarId && calendars && calendars.length > 0) {
+      const primaryCal = calendars.find((c) => c.primary && c.id !== '_all_calendars_') || calendars.find((c) => c.id !== '_all_calendars_');
+      if (primaryCal) setSyncTargetCalendarId(primaryCal.id);
+    }
+    setShowSyncModal(true);
   };
 
   const handleSyncToTargetCalendar = async (targetCalendarId?: string, sourceListId?: string) => {
@@ -197,7 +249,7 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
     try {
       setIsSyncingCalendar(true);
       await onSyncTasksToCalendar(targetCalendarId, sourceListId);
-      setShowCalendarDropdown(false);
+      setShowSyncModal(false);
     } finally {
       setIsSyncingCalendar(false);
     }
@@ -224,13 +276,19 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
   const [editingTask, setEditingTask] = useState<GoogleTaskItem | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const [editDue, setEditDue] = useState('');
+  const [editHasTime, setEditHasTime] = useState(false);
   const [editTime, setEditTime] = useState('18:00');
   const [editColorId, setEditColorId] = useState<string>('');
+  const [editTargetCalendarId, setEditTargetCalendarId] = useState<string>('');
   const [editNotes, setEditNotes] = useState('');
   const [editTaskListId, setEditTaskListId] = useState<string>('');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
   const [alsoAddToCalendar, setAlsoAddToCalendar] = useState(false);
   const [addingToCalendarTaskId, setAddingToCalendarTaskId] = useState<string | null>(null);
+
+  // New task calendar & color state
+  const [newTaskTargetCalendarId, setNewTaskTargetCalendarId] = useState<string>('');
+  const [newTaskColorId, setNewTaskColorId] = useState<string>('');
 
   // Date range filter state
   const [internalDateRange, setInternalDateRange] = useState<DateRangeState>(() => {
@@ -314,13 +372,16 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
       return explicitTime ? { text: `godz. ${explicitTime}`, isPast: false, isToday: false, time: explicitTime } : null;
     }
 
-    const date = new Date(dueString);
+    const localDateStr = extractLocalDateStr(dueString);
+    if (!localDateStr) return null;
+
+    const [year, month, day] = localDateStr.split('-').map(Number);
+    const date = new Date(year, month - 1, day);
     if (isNaN(date.getTime())) return null;
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const dueDate = new Date(date);
-    dueDate.setHours(0, 0, 0, 0);
+    const dueDate = new Date(year, month - 1, day, 0, 0, 0, 0);
 
     const isPast = dueDate.getTime() < today.getTime();
     const isToday = dueDate.getTime() === today.getTime();
@@ -331,12 +392,11 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
       year: 'numeric',
     });
 
-    const timeToDisplay = explicitTime || '18:00';
-    const fullText = `${formattedDate}, godz. ${timeToDisplay}`;
+    const fullText = explicitTime ? `${formattedDate}, godz. ${explicitTime}` : formattedDate;
 
     return {
       text: fullText,
-      time: timeToDisplay,
+      time: explicitTime || null,
       isPast,
       isToday,
     };
@@ -351,53 +411,63 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
       let rfcDue: string | undefined = undefined;
       const clean = cleanTaskTitle(newTaskTitle.trim());
 
-      let taskHour = newTaskTime && /^(\d{1,2}):(\d{2})$/.test(newTaskTime) ? newTaskTime : undefined;
-      if (!taskHour && templates && templates.length > 0) {
-        const matched = templates.find(
-          (t) => cleanTaskTitle(t.title).toLowerCase() === clean.toLowerCase()
-        );
-        if (matched?.time) taskHour = matched.time;
-      }
-      if (!taskHour && newTaskDue) {
-        taskHour = '18:00';
+      let taskHour: string | undefined = undefined;
+      if (newTaskHasTime && newTaskTime && /^(\d{1,2}):(\d{2})$/.test(newTaskTime)) {
+        taskHour = newTaskTime;
       }
 
       if (newTaskDue) {
         const { year, month, day } = parseDateComponents(newTaskDue);
-        let [h, m] = (taskHour || '18:00').split(':').map(Number);
-        if (isNaN(h)) h = 18;
-        if (isNaN(m)) m = 0;
-        const target = new Date(year, month, day, h, m, 0, 0);
-        rfcDue = formatToRfc3339(target);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        if (taskHour) {
+          let [h, m] = taskHour.split(':').map(Number);
+          if (isNaN(h)) h = 18;
+          if (isNaN(m)) m = 0;
+          const target = new Date(year, month, day, h, m, 0, 0);
+          rfcDue = formatToRfc3339(target);
+        } else {
+          // Date-only in Google Tasks format (T00:00:00.000Z)
+          rfcDue = `${year}-${pad(month + 1)}-${pad(day)}T00:00:00.000Z`;
+        }
       }
 
-      const finalTitle = clean;
-      const notesToSave = newTaskNotes.trim() || undefined;
+      let finalTitle = clean;
+      if (includeTimeInTitle && taskHour) {
+        finalTitle = formatTaskTitleWithTime(clean, taskHour);
+      }
+
+      // Do NOT auto-inject any hour notes; only save notes if explicitly provided by user
+      const finalNotes = newTaskNotes.trim() ? newTaskNotes.trim() : undefined;
 
       const targetListToUse =
         newTaskTargetListId ||
         (taskList && taskList.id !== ALL_TASK_LISTS_ID ? taskList.id : undefined);
 
-      await onAddTaskManually(finalTitle, notesToSave, rfcDue, targetListToUse);
+      const created = await onAddTaskManually(finalTitle, finalNotes, rfcDue, targetListToUse);
 
-      if (newTaskAlsoCalendar && onAddTaskToCalendar && rfcDue) {
+      if (newTaskAlsoCalendar && onAddTaskToCalendar && newTaskDue) {
         await onAddTaskToCalendar(
-          {
+          created || {
             id: `temp-${Date.now()}`,
             title: clean,
             due: rfcDue,
-            notes: notesToSave,
+            notes: finalNotes,
             status: 'needsAction',
           },
-          taskHour || '18:00'
+          taskHour,
+          newTaskColorId || undefined,
+          newTaskTargetCalendarId || undefined,
+          !taskHour
         );
       }
 
       setNewTaskTitle('');
       setNewTaskDue('');
+      setNewTaskHasTime(false);
       setNewTaskTime('');
       setNewTaskNotes('');
       setNewTaskAlsoCalendar(false);
+      setNewTaskColorId('');
       setShowNewTaskModal(false);
     } finally {
       setIsSubmitting(false);
@@ -481,40 +551,41 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
     const originalTask = task.originalTaskId
       ? tasks.find((t) => t.id === task.originalTaskId) || task
       : task;
-    const { time, cleanTitle } = extractTaskTitleAndTime(originalTask.title, originalTask.notes, templates);
-    let templateTime = '18:00';
-    if (templates && templates.length > 0) {
-      const matched = templates.find(
-        (t) => cleanTaskTitle(t.title).toLowerCase() === cleanTitle.toLowerCase()
-      );
-      if (matched?.time) {
-        templateTime = matched.time;
-      }
-    }
+    const rawDue = task.due || originalTask.due;
+    const { time, cleanTitle } = extractTaskTitleAndTime(
+      originalTask.title,
+      originalTask.notes,
+      templates,
+      rawDue
+    );
 
     setEditingTask(originalTask);
     setEditTitle(cleanTitle);
 
-    if (task.due || originalTask.due) {
-      const d = new Date(task.due || originalTask.due || '');
-      if (!isNaN(d.getTime())) {
-        const pad = (n: number) => String(n).padStart(2, '0');
-        setEditDue(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`);
-      } else {
-        setEditDue('');
-      }
+    if (rawDue) {
+      const datePart = extractLocalDateStr(rawDue);
+      setEditDue(datePart || '');
     } else {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const pad = (n: number) => String(n).padStart(2, '0');
-      setEditDue(`${tomorrow.getFullYear()}-${pad(tomorrow.getMonth() + 1)}-${pad(tomorrow.getDate())}`);
+      setEditDue('');
     }
 
-    setEditTime(time || templateTime);
+    if (time) {
+      setEditHasTime(true);
+      setEditTime(time);
+    } else {
+      setEditHasTime(false);
+      setEditTime('18:00');
+    }
+
     const matchedTemplate = templates?.find(
       (t) => cleanTaskTitle(t.title).toLowerCase() === cleanTitle.toLowerCase()
     );
     setEditColorId(matchedTemplate?.colorId || '');
+    const defaultCalId =
+      findPrimaryCalendar(calendars)?.id ||
+      calendars.find((c) => c.id !== ALL_CALENDARS_ID)?.id ||
+      'primary';
+    setEditTargetCalendarId(defaultCalId);
     setEditNotes(task.notes || '');
     setEditTaskListId(
       task.taskListId ||
@@ -530,23 +601,44 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
     try {
       setIsSavingEdit(true);
       let rfcDue: string | undefined = undefined;
-      const taskHour = editTime || '18:00';
-      if (editDue) {
-        const { year, month, day } = parseDateComponents(editDue);
-        let [h, m] = taskHour.split(':').map(Number);
-        if (isNaN(h)) h = 18;
-        if (isNaN(m)) m = 0;
-        const target = new Date(year, month, day, h, m, 0, 0);
-        rfcDue = formatToRfc3339(target);
+      const clean = cleanTaskTitle(editTitle.trim());
+
+      let taskHour: string | undefined = undefined;
+      if (editHasTime && editTime && /^(\d{1,2}):(\d{2})$/.test(editTime)) {
+        taskHour = editTime;
       }
 
-      const clean = cleanTaskTitle(editTitle.trim());
-      const titleToSave = clean;
+      if (editDue) {
+        const { year, month, day } = parseDateComponents(editDue);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        if (taskHour) {
+          let [h, m] = taskHour.split(':').map(Number);
+          if (isNaN(h)) h = 18;
+          if (isNaN(m)) m = 0;
+          const target = new Date(year, month, day, h, m, 0, 0);
+          rfcDue = formatToRfc3339(target);
+        } else {
+          // Date-only in Google Tasks format (T00:00:00.000Z)
+          rfcDue = `${year}-${pad(month + 1)}-${pad(day)}T00:00:00.000Z`;
+        }
+      } else {
+        rfcDue = '';
+      }
 
-      // Clean notes from any automatic hour line
+      let titleToSave = clean;
+      if (includeTimeInTitle && taskHour) {
+        titleToSave = formatTaskTitleWithTime(clean, taskHour);
+      }
+
       let updatedNotes = editNotes
-        .replace(/(?:⏰\s*)?Godzina(?:\s*wykonania)?:\s*\d{1,2}:\d{2}\s*/gi, '')
+        .replace(/(?:⏰\s*)?Godzina(?:\s*wykonania|\s*rozpoczęcia)?:\s*\d{1,2}:\d{2}\s*/gi, '')
         .trim();
+
+      if (taskHour && !includeTimeInTitle) {
+        updatedNotes = updatedNotes
+          ? `${updatedNotes}\n⏰ Godzina rozpoczęcia: ${taskHour}`
+          : `⏰ Godzina rozpoczęcia: ${taskHour}`;
+      }
 
       await onUpdateTask(
         editingTask.id,
@@ -559,11 +651,12 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
         editingTask.taskListId
       );
 
-      if (alsoAddToCalendar && onAddTaskToCalendar) {
+      if (alsoAddToCalendar && onAddTaskToCalendar && editDue) {
         await onAddTaskToCalendar(
           { ...editingTask, title: clean, due: rfcDue, notes: updatedNotes },
-          taskHour,
-          editColorId || undefined
+          taskHour || '18:00',
+          editColorId || undefined,
+          editTargetCalendarId || undefined
         );
       }
 
@@ -575,16 +668,21 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
 
   const handleQuickAddToCalendar = async (task: GoogleTaskItem) => {
     if (!onAddTaskToCalendar) return;
-    const { time, cleanTitle } = extractTaskTitleAndTime(task.title, task.notes, templates);
+    const { time, cleanTitle } = extractTaskTitleAndTime(task.title, task.notes, templates, task.due);
     let resolvedTime = time;
     let matchedColorId: string | undefined = undefined;
     if (templates && templates.length > 0) {
       const matched = templates.find(
         (t) => cleanTaskTitle(t.title).toLowerCase() === cleanTitle.toLowerCase()
       );
-      if (matched?.time) resolvedTime = matched.time;
-      if (matched?.colorId) matchedColorId = matched.colorId;
+      if (matched?.time && !resolvedTime) {
+        resolvedTime = matched.time;
+      }
+      if (matched?.colorId) {
+        matchedColorId = matched.colorId;
+      }
     }
+
     try {
       setAddingToCalendarTaskId(task.id);
       await onAddTaskToCalendar(task, resolvedTime || '18:00', matchedColorId);
@@ -666,7 +764,7 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
           <div className="pt-2.5">
             <button
               type="button"
-              onClick={() => setShowNewTaskModal(true)}
+              onClick={handleOpenNewTaskModal}
               className="inline-flex items-center space-x-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 px-3 py-1.5 rounded-lg transition shadow-xs cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -679,7 +777,7 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
           {filteredTasks.map((task) => {
             const isCompleted = task.status === 'completed';
             const isToggling = togglingTaskId === task.id;
-            const { time: extractedTime, cleanTitle } = extractTaskTitleAndTime(task.title, task.notes, templates);
+            const { time: extractedTime, cleanTitle } = extractTaskTitleAndTime(task.title, task.notes, templates, task.due);
             const dueInfo = formatDueDate(task.due, extractedTime);
 
             return (
@@ -687,8 +785,8 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
                 key={task.id}
                 className={`group flex items-start justify-between p-3 rounded-xl border transition-all ${
                   isCompleted
-                    ? 'bg-neutral-50/70 border-neutral-200/60 opacity-75'
-                    : 'bg-white border-neutral-200 hover:border-neutral-300 shadow-2xs'
+                    ? 'bg-neutral-50/70 border-neutral-200/60 opacity-55 hover:opacity-85'
+                    : 'bg-white border-neutral-200 hover:border-neutral-300 shadow-2xs opacity-100'
                 }`}
               >
                 <div className="flex items-start space-x-3 flex-1 min-w-0">
@@ -810,6 +908,351 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
     </>
   );
 
+  // Render Tasks Controls dropdown menu ('...' button to the left of task list name)
+  const renderTasksControlsMenuContent = () => (
+    <div className="space-y-3 max-h-[75vh] overflow-y-auto pr-1 text-left select-none">
+      {/* Header */}
+      <div className="flex items-center justify-between pb-2 border-b border-neutral-200">
+        <div className="flex items-center space-x-2">
+          <div className="w-6 h-6 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+            <ListTodo className="w-3.5 h-3.5" />
+          </div>
+          <div>
+            <h3 className="text-xs font-bold text-neutral-900">Sterowanie zadaniami</h3>
+            <span className="text-[10px] text-neutral-500 block">Akcje, filtry, listy i narzędzia</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowTasksControlsMenu(false)}
+          className="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-colors cursor-pointer"
+          title="Zamknij"
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* 1. Szybkie akcje (Nowe zadanie, Odśwież, Nowa lista, Do Kalendarza) */}
+      <div className="space-y-1.5">
+        <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider block">
+          Akcje zadań
+        </span>
+        <div className="grid grid-cols-2 gap-1.5">
+          <button
+            type="button"
+            id="btn-tasks-menu-new-task"
+            onClick={() => {
+              setShowTasksControlsMenu(false);
+              handleOpenNewTaskModal();
+            }}
+            className="w-full inline-flex items-center justify-center space-x-1 px-2 py-1.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white rounded-lg text-xs font-semibold shadow-2xs transition-colors cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>+ Nowe zadanie</span>
+          </button>
+
+          <button
+            type="button"
+            id="btn-tasks-menu-refresh"
+            onClick={() => onRefreshTasks()}
+            disabled={isLoadingTasks}
+            className="w-full inline-flex items-center justify-center space-x-1.5 px-2 py-1.5 bg-white hover:bg-neutral-50 active:bg-neutral-100 text-neutral-700 border border-neutral-250 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoadingTasks ? 'animate-spin text-emerald-600' : 'text-neutral-600'}`} />
+            <span>{isLoadingTasks ? 'Odświeżanie...' : 'Odśwież'}</span>
+          </button>
+
+          {onCreateTaskList && (
+            <button
+              type="button"
+              id="btn-tasks-menu-new-list"
+              onClick={() => {
+                setShowTasksControlsMenu(false);
+                setNewListName('');
+                setShowNewListModal(true);
+              }}
+              className="w-full inline-flex items-center justify-center space-x-1 px-2 py-1.5 bg-white hover:bg-neutral-50 text-neutral-700 border border-neutral-250 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5 text-emerald-600" />
+              <span>+ Nowa lista</span>
+            </button>
+          )}
+
+          {onSyncTasksToCalendar && (
+            <button
+              type="button"
+              id="btn-tasks-menu-sync"
+              onClick={() => {
+                setShowTasksControlsMenu(false);
+                handleOpenSyncModal();
+              }}
+              className="w-full inline-flex items-center justify-center space-x-1 px-2 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+            >
+              <Calendar className="w-3.5 h-3.5" />
+              <span>Do Kalendarza</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* 2. Wybór / przełączanie list zadań */}
+      {taskLists && taskLists.length > 0 && (
+        <div className="space-y-1.5 p-2 bg-neutral-50/70 rounded-xl border border-neutral-200">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-bold text-neutral-800 uppercase tracking-wider">
+              Listy zadań ({taskLists.length})
+            </span>
+            {onSelectAllTaskLists && onClearAllTaskLists && (
+              <div className="space-x-1.5 text-[10px]">
+                <button
+                  type="button"
+                  onClick={onSelectAllTaskLists}
+                  className="text-emerald-600 hover:underline cursor-pointer font-medium"
+                >
+                  Wszystkie
+                </button>
+                <span className="text-neutral-300">•</span>
+                <button
+                  type="button"
+                  onClick={onClearAllTaskLists}
+                  className="text-neutral-500 hover:underline cursor-pointer"
+                >
+                  Wyczyść
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+            {taskLists.map((tl) => {
+              const isChecked =
+                !selectedTaskListIds ||
+                selectedTaskListIds.length === 0 ||
+                selectedTaskListIds.includes(ALL_TASK_LISTS_ID) ||
+                selectedTaskListIds.includes(tl.id);
+              const isCurrent = taskList?.id === tl.id;
+              return (
+                <div
+                  key={tl.id}
+                  className="flex items-center justify-between py-0.5 px-1 rounded-md hover:bg-neutral-100/80 transition-colors"
+                >
+                  <label className="flex items-center space-x-2 text-xs text-neutral-700 hover:text-neutral-900 cursor-pointer min-w-0 flex-1 select-none">
+                    {onToggleTaskListId && (
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => onToggleTaskListId(tl.id)}
+                        className="rounded text-emerald-600 focus:ring-emerald-500 w-3.5 h-3.5 cursor-pointer shrink-0"
+                      />
+                    )}
+                    <span className={`truncate text-[11px] ${isCurrent ? 'font-bold text-neutral-900' : ''}`} title={tl.title}>
+                      {tl.title}
+                    </span>
+                  </label>
+                  {onSelectTaskList && !isCurrent && (
+                    <button
+                      type="button"
+                      onClick={() => onSelectTaskList(tl)}
+                      className="text-[10px] text-emerald-700 hover:underline cursor-pointer px-1 py-0.5 shrink-0"
+                    >
+                      Wybierz
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* 3. Zakres dat i zadania bez terminu */}
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider block">
+            Zakres dat zadań
+          </span>
+          <span className="text-[10px] font-semibold text-emerald-700">
+            {DATE_PRESET_LABELS[activeDateRange.preset] || activeDateRange.preset}
+          </span>
+        </div>
+        <div className="grid grid-cols-3 gap-1 text-[11px]">
+          {(
+            [
+              { preset: 'all', label: 'Wszystkie' },
+              { preset: 'today', label: 'Dzisiaj' },
+              { preset: 'from_today', label: 'Od dzisiaj' },
+              { preset: 'next_7_days', label: '7 dni' },
+              { preset: 'next_30_days', label: '30 dni' },
+              { preset: 'this_month', label: 'Ten miesiąc' },
+            ] as const
+          ).map((p) => {
+            const isSelected = activeDateRange.preset === p.preset;
+            return (
+              <button
+                key={p.preset}
+                type="button"
+                onClick={() => {
+                  const { startDate, endDate } = calculatePresetDates(p.preset);
+                  handleDateRangeChange({ preset: p.preset, startDate, endDate });
+                }}
+                className={`px-2 py-1 rounded-lg border transition cursor-pointer text-center ${
+                  isSelected
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-300 font-bold ring-1 ring-emerald-400/20'
+                    : 'bg-white hover:bg-neutral-50 text-neutral-700 border-neutral-250'
+                }`}
+              >
+                {p.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Checkbox zadania bez terminu */}
+        <label className="flex items-center space-x-2 text-xs text-neutral-700 hover:text-neutral-900 cursor-pointer pt-1 select-none">
+          <input
+            type="checkbox"
+            checked={includeNoDateTasks}
+            onChange={(e) => handleToggleIncludeNoDate(e.target.checked)}
+            className="rounded text-emerald-600 focus:ring-emerald-500 w-3.5 h-3.5 cursor-pointer shrink-0"
+          />
+          <span className="text-[11px]">Uwzględnij zadania bez terminu ({noDateCount})</span>
+        </label>
+      </div>
+
+      {/* 4. Filtr statusu zadań (Wszystkie, Do zrobienia, Ukończone) */}
+      <div className="space-y-1.5">
+        <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider block">
+          Status zadań
+        </span>
+        <div className="grid grid-cols-3 gap-1 bg-neutral-100 p-1 rounded-xl border border-neutral-200">
+          {(
+            [
+              { id: 'all', label: 'Wszystkie' },
+              { id: 'active', label: 'Do zrobienia' },
+              { id: 'completed', label: 'Ukończone' },
+            ] as const
+          ).map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => setFilter(s.id)}
+              className={`px-2 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer text-center ${
+                filter === s.id
+                  ? 'bg-neutral-800 text-white font-semibold shadow-2xs'
+                  : 'text-neutral-600 hover:text-neutral-900 hover:bg-white/50'
+              }`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 5. Narzędzia porządkowe i masowe */}
+      <div className="space-y-1.5 p-2 bg-neutral-50/70 rounded-xl border border-neutral-200">
+        <span className="text-[11px] font-bold text-neutral-800 uppercase tracking-wider block">
+          Narzędzia
+        </span>
+        <div className="space-y-1.5">
+          {onToggleIncludeTimeInTitle && (
+            <label className="flex items-center space-x-2 text-xs text-neutral-700 hover:text-neutral-900 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={!!includeTimeInTitle}
+                onChange={(e) => onToggleIncludeTimeInTitle(e.target.checked)}
+                className="rounded text-emerald-600 focus:ring-emerald-500 w-3.5 h-3.5 cursor-pointer shrink-0"
+              />
+              <span className="text-[11px]">Dołącz godzinę do tytułu</span>
+            </label>
+          )}
+
+          {onRemoveHoursFromTitles && (
+            <button
+              type="button"
+              onClick={async () => {
+                setIsRemovingHours(true);
+                try {
+                  await onRemoveHoursFromTitles();
+                } finally {
+                  setIsRemovingHours(false);
+                }
+              }}
+              disabled={isRemovingHours}
+              className="w-full text-left px-2 py-1 rounded-md text-[11px] text-neutral-700 hover:bg-neutral-200/60 transition cursor-pointer"
+            >
+              {isRemovingHours ? 'Usuwanie godzin...' : 'Usuń godziny z tytułów'}
+            </button>
+          )}
+
+          {onClearAllNotes && (
+            <button
+              type="button"
+              onClick={async () => {
+                setIsCleaningNotes(true);
+                try {
+                  await onClearAllNotes();
+                } finally {
+                  setIsCleaningNotes(false);
+                }
+              }}
+              disabled={isCleaningNotes}
+              className="w-full text-left px-2 py-1 rounded-md text-[11px] text-neutral-700 hover:bg-neutral-200/60 transition cursor-pointer"
+            >
+              {isCleaningNotes ? 'Czyszczenie notatek...' : 'Wyczyść notatki zadań'}
+            </button>
+          )}
+
+          {onCleanHoursAndNotes && (
+            <button
+              type="button"
+              onClick={async () => {
+                setIsCleaningNotes(true);
+                try {
+                  await onCleanHoursAndNotes();
+                } finally {
+                  setIsCleaningNotes(false);
+                }
+              }}
+              disabled={isCleaningNotes}
+              className="w-full text-left px-2 py-1 rounded-md text-[11px] text-neutral-700 hover:bg-neutral-200/60 transition cursor-pointer"
+            >
+              {isCleaningNotes ? 'Czyszczenie...' : 'Wyczyść godziny i notatki'}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Footer Links: Google Tasks Link & Sidebar toggle */}
+      <div className="pt-2 border-t border-neutral-200 flex items-center justify-between gap-2 text-xs">
+        <a
+          href="https://tasks.google.com"
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center space-x-1 text-emerald-700 hover:text-emerald-900 font-medium hover:underline text-[11px]"
+        >
+          <span>Google Tasks</span>
+          <ExternalLink className="w-3 h-3" />
+        </a>
+
+        {(onToggleSidebar || onCloseSidebar) && (
+          <button
+            type="button"
+            onClick={() => {
+              setShowTasksControlsMenu(false);
+              if (onToggleSidebar) {
+                onToggleSidebar();
+              } else if (onCloseSidebar) {
+                onCloseSidebar();
+              }
+            }}
+            className="text-neutral-500 hover:text-neutral-800 text-[11px] hover:underline cursor-pointer"
+          >
+            {isSidebarOpen ? 'Ukryj panel boczny' : 'Pokaż panel boczny'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
   const renderSidebarLayout = () => (
     <div className="bg-white rounded-2xl border border-neutral-200/90 shadow-sm overflow-hidden h-full w-full min-h-0 relative flex flex-col">
       {/* Backdrop overlay na całym ekranie */}
@@ -871,7 +1314,7 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
         <button
           id="btn-open-add-task-modal-sidebar"
           type="button"
-          onClick={() => setShowNewTaskModal(true)}
+          onClick={handleOpenNewTaskModal}
           className="w-full inline-flex items-center justify-center space-x-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs sm:text-sm font-semibold shadow-xs hover:shadow-md transition-all cursor-pointer"
           title="Dodaj nowe zadanie z datą i godziną"
         >
@@ -896,130 +1339,21 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
           )}
 
           {onSyncTasksToCalendar && (taskLists.length > 0 || tasks.length > 0) && (
-            <div ref={calendarDropdownRef} className="relative flex-1">
-              <button
-                id="btn-sync-to-calendar-sidebar"
-                type="button"
-                onClick={handleOpenSyncDropdown}
-                disabled={isSyncingCalendar}
-                className="w-full inline-flex items-center justify-center space-x-1 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 py-1.5 px-2 rounded-lg transition-colors cursor-pointer shadow-2xs disabled:opacity-50"
-                title="Wybierz listę zadań oraz kalendarz docelowy, aby dodać zadania"
-              >
-                {isSyncingCalendar ? (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Sparkles className="w-3.5 h-3.5" />
-                )}
-                <span>Do Kalendarza</span>
-                <ChevronDown className={`w-3 h-3 transition-transform ${showCalendarDropdown ? 'rotate-180' : ''}`} />
-              </button>
-
-              {/* Dropdown wyboru docelowych kalendarzy i list zadań */}
-              {showCalendarDropdown && (
-                <div className="absolute left-0 mt-1.5 w-80 sm:w-96 max-w-[calc(100vw-2rem)] bg-white rounded-2xl shadow-2xl border border-neutral-200 z-50 p-4 space-y-3.5 animate-in fade-in zoom-in-95 duration-150 text-left">
-                  <div className="flex items-center justify-between pb-2.5 border-b border-neutral-100">
-                    <div className="flex items-center space-x-2.5">
-                      <div className="w-8 h-8 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
-                        <Calendar className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <h4 className="text-xs font-bold text-neutral-900">
-                          Dodaj zadania do kalendarza
-                        </h4>
-                        <p className="text-[10px] text-neutral-500">
-                          Wskaż listę zadań i docelowy Kalendarz Google
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setShowCalendarDropdown(false)}
-                      className="p-1 rounded-lg text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 transition-colors cursor-pointer"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="block text-[11px] font-bold text-neutral-700 uppercase tracking-wider">
-                      Lista zadań (źródło)
-                    </label>
-                    <select
-                      id="select-sync-source-tasklist-sidebar"
-                      value={syncSourceListId}
-                      onChange={(e) => setSyncSourceListId(e.target.value)}
-                      className="w-full text-xs border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white text-neutral-900 font-medium"
-                    >
-                      <option value={ALL_TASK_LISTS_ID}>Wszystkie listy zadań ({tasks.length} zadań)</option>
-                      {taskLists
-                        .filter((tl) => tl.id !== ALL_TASK_LISTS_ID)
-                        .map((tl) => (
-                          <option key={tl.id} value={tl.id}>
-                            {tl.title}
-                          </option>
-                        ))}
-                    </select>
-                    <p className="text-[10px] text-neutral-500">
-                      Znaleziono {selectedSourceListTasks.length} {selectedSourceListTasks.length === 1 ? 'zadanie' : 'zadań'} do synchronizacji.
-                    </p>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="block text-[11px] font-bold text-neutral-700 uppercase tracking-wider">
-                      Docelowy Kalendarz Google
-                    </label>
-                    <select
-                      id="select-sync-target-calendar-sidebar"
-                      value={syncTargetCalendarId}
-                      onChange={(e) => setSyncTargetCalendarId(e.target.value)}
-                      className="w-full text-xs border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white text-neutral-900 font-medium"
-                    >
-                      {calendars
-                        .filter((c) => c.id !== ALL_CALENDARS_ID)
-                        .map((cal) => (
-                          <option key={cal.id} value={cal.id}>
-                            {cal.summary} {cal.primary ? '(Domyślny)' : ''}
-                          </option>
-                        ))}
-                    </select>
-                  </div>
-
-                  <div className="p-2.5 rounded-xl bg-blue-50/60 border border-blue-100 text-[11px] text-blue-900 leading-relaxed">
-                    Zadania posiadające termin zostaną dodane jako wydarzenia w wybranym kalendarzu.
-                  </div>
-
-                  <div className="flex items-center justify-end space-x-2 pt-1 border-t border-neutral-100">
-                    <button
-                      type="button"
-                      onClick={() => setShowCalendarDropdown(false)}
-                      disabled={isSyncingCalendar}
-                      className="px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-colors cursor-pointer"
-                    >
-                      Anuluj
-                    </button>
-                    <button
-                      id="btn-confirm-sync-tasks-to-calendar-sidebar"
-                      type="button"
-                      onClick={() => handleSyncToTargetCalendar(syncTargetCalendarId, syncSourceListId)}
-                      disabled={isSyncingCalendar || selectedSourceListTasks.length === 0}
-                      className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
-                    >
-                      {isSyncingCalendar ? (
-                        <>
-                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                          <span>Dodawanie...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles className="w-3.5 h-3.5" />
-                          <span>Dodaj do Kalendarza</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
+            <button
+              id="btn-sync-to-calendar-sidebar"
+              type="button"
+              onClick={handleOpenSyncModal}
+              disabled={isSyncingCalendar}
+              className="flex-1 inline-flex items-center justify-center space-x-1 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 py-1.5 px-2 rounded-lg transition-colors cursor-pointer shadow-2xs disabled:opacity-50"
+              title="Wybierz listę zadań oraz kalendarz docelowy, aby dodać zadania"
+            >
+              {isSyncingCalendar ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Sparkles className="w-3.5 h-3.5" />
               )}
-            </div>
+              <span>Do Kalendarza</span>
+            </button>
           )}
         </div>
 
@@ -1207,10 +1541,31 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
       <div className="flex-1 w-full min-w-0 h-full flex flex-col bg-white overflow-hidden">
         {/* Top Mini Header Bar */}
         <div className="px-3 sm:px-4 py-2 sm:py-2.5 border-b border-neutral-200 bg-white flex items-center justify-between gap-3 shrink-0">
-          <div className="flex items-center space-x-2 min-w-0">
-            <div className="w-7 h-7 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
-              <ListTodo className="w-4 h-4" />
+          <div className="flex items-center space-x-2.5 min-w-0">
+            {/* Przycisk '...' z rozwijaną listą opcji sterowania Zadaniami po lewej stronie od nazwy listy zadań (kółko z '...' wewnątrz) */}
+            <div className="relative shrink-0 flex items-center" ref={tasksControlsDropdownRef}>
+              <button
+                type="button"
+                id="btn-sidebar-tasks-controls"
+                onClick={() => setShowTasksControlsMenu((prev) => !prev)}
+                className={`p-1.5 rounded-full transition-all cursor-pointer border shadow-2xs flex items-center justify-center ${
+                  showTasksControlsMenu
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-700 ring-2 ring-emerald-500/20 shadow-xs'
+                    : 'bg-white hover:bg-neutral-100 border-neutral-250 text-neutral-600 hover:text-neutral-900'
+                }`}
+                title={showTasksControlsMenu ? 'Ukryj opcje sterowania zadaniami (...)' : 'Pokaż opcje sterowania zadaniami (...)'}
+                aria-label="Opcje sterowania zadaniami"
+              >
+                <MoreHorizontal className="w-4 h-4 stroke-[2.5]" />
+              </button>
+
+              {showTasksControlsMenu && (
+                <div className="absolute left-0 top-full mt-1.5 z-50 w-72 sm:w-80 max-w-[88vw] bg-white rounded-2xl border border-neutral-200 shadow-xl p-3 sm:p-3.5">
+                  {renderTasksControlsMenuContent()}
+                </div>
+              )}
             </div>
+
             <div className="min-w-0">
               <h2 className="text-sm sm:text-base font-bold text-neutral-900 tracking-tight truncate">
                 {taskList?.title || 'Wszystkie listy zadań'}
@@ -1227,18 +1582,6 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
               <span className="text-neutral-400">&bull;</span>
               <span>{progressPercent}%</span>
             </div>
-
-            {onBackToDashboard && (
-              <button
-                type="button"
-                onClick={onBackToDashboard}
-                className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-neutral-700 bg-white hover:bg-neutral-100 border border-neutral-250 transition cursor-pointer shadow-2xs"
-                title="Powrót do pulpitu"
-              >
-                <LayoutDashboard className="w-3.5 h-3.5 text-blue-600" />
-                <span className="hidden sm:inline">Pulpit</span>
-              </button>
-            )}
           </div>
         </div>
 
@@ -1277,20 +1620,20 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
                 <h2 className="text-base font-semibold text-neutral-900">
                   Lista zadań
                 </h2>
-
-                {onToggleTaskListId && onSelectAllTaskLists && onClearAllTaskLists && (
-                  <ChecklistPopover
-                    label="Listy"
-                    triggerId="btn-tasklist-checkbox-filter"
-                    items={checklistTaskOptions}
-                    selectedIds={selectedTaskListIds}
-                    allId={ALL_TASK_LISTS_ID}
-                    onToggleId={onToggleTaskListId}
-                    onSelectAll={onSelectAllTaskLists}
-                    onClearAll={onClearAllTaskLists}
-                    align="left"
-                  />
-                )}
+                <button
+                  type="button"
+                  id="btn-toggle-tasks-controls"
+                  onClick={toggleControls}
+                  className={`p-1.5 rounded-full transition-all cursor-pointer border shadow-2xs flex items-center justify-center ${
+                    isControlsOpen
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-700 ring-2 ring-emerald-500/20 shadow-xs'
+                      : 'bg-white hover:bg-neutral-100 border-neutral-250 text-neutral-600 hover:text-neutral-900'
+                  }`}
+                  title={isControlsOpen ? 'Ukryj opcje sterowania zadaniami (...)' : 'Pokaż opcje sterowania zadaniami (...)'}
+                  aria-label="Opcje sterowania zadaniami"
+                >
+                  <MoreHorizontal className="w-4 h-4 stroke-[2.5]" />
+                </button>
               </div>
             </div>
 
@@ -1321,257 +1664,137 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
             </div>
           </div>
 
-          {/* Row 2: Add task, Add list, Badge & Do Kalendarza */}
-          <div className="flex items-center justify-between gap-2 min-h-[32px]">
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                id="btn-open-add-task-modal"
-                type="button"
-                onClick={() => setShowNewTaskModal(true)}
-                className="inline-flex items-center space-x-1 text-xs font-medium text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
-                title="Dodaj nowe zadanie z datą i godziną"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Nowe zadanie</span>
-              </button>
+          {/* Collapsible Row: Add task, Add list, Badge & Do Kalendarza */}
+          {isControlsOpen && (
+            <div className="space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 min-h-[32px] pt-1 border-t border-neutral-200/60">
+                <div className="flex flex-wrap items-center gap-2">
+                  {onToggleTaskListId && onSelectAllTaskLists && onClearAllTaskLists && (
+                    <ChecklistPopover
+                      label="Listy"
+                      triggerId="btn-tasklist-checkbox-filter"
+                      items={checklistTaskOptions}
+                      selectedIds={selectedTaskListIds}
+                      allId={ALL_TASK_LISTS_ID}
+                      onToggleId={onToggleTaskListId}
+                      onSelectAll={onSelectAllTaskLists}
+                      onClearAll={onClearAllTaskLists}
+                      align="left"
+                    />
+                  )}
 
-              {onCreateTaskList && (
-                <button
-                  type="button"
-                  onClick={() => setShowNewListModal(true)}
-                  className="inline-flex items-center space-x-1 text-xs font-medium text-neutral-700 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 border border-neutral-300 px-2 py-1.5 rounded-lg transition-colors cursor-pointer"
-                  title="Utwórz nową listę zadań Google"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Nowa lista</span>
-                </button>
-              )}
-
-              <span className="inline-flex items-center px-2 py-1 rounded text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                Google Tasks
-              </span>
-
-              {onSyncTasksToCalendar && (taskLists.length > 0 || tasks.length > 0) && (
-                <div ref={calendarDropdownRef} className="relative inline-block text-left">
                   <button
-                    id="btn-sync-to-calendar"
+                    id="btn-open-add-task-modal"
                     type="button"
-                    onClick={handleOpenSyncDropdown}
-                    disabled={isSyncingCalendar}
-                    className="inline-flex items-center space-x-1 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer shadow-xs disabled:opacity-50"
-                    title="Wybierz listę zadań oraz kalendarz docelowy, aby dodać zadania"
+                    onClick={handleOpenNewTaskModal}
+                    className="inline-flex items-center space-x-1 text-xs font-medium text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+                    title="Dodaj nowe zadanie z datą i godziną"
                   >
-                    {isSyncingCalendar ? (
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Sparkles className="w-3.5 h-3.5" />
-                    )}
-                    <span>Do Kalendarza</span>
-                    <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showCalendarDropdown ? 'rotate-180' : ''}`} />
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Nowe zadanie</span>
                   </button>
 
-                  {showCalendarDropdown && (
-                    <div className="absolute left-0 mt-1.5 w-80 sm:w-96 max-w-[calc(100vw-2rem)] bg-white rounded-2xl shadow-2xl border border-neutral-200 z-50 p-4 space-y-3.5 animate-in fade-in zoom-in-95 duration-150">
-                      {/* Header */}
-                      <div className="flex items-center justify-between pb-2.5 border-b border-neutral-100">
-                        <div className="flex items-center space-x-2.5">
-                          <div className="w-8 h-8 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
-                            <Calendar className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <h4 className="text-xs font-bold text-neutral-900">
-                              Dodaj zadania do kalendarza
-                            </h4>
-                            <p className="text-[10px] text-neutral-500">
-                              Wskaż listę zadań i docelowy Kalendarz Google
-                            </p>
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setShowCalendarDropdown(false)}
-                          className="p-1 rounded-lg text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 transition-colors cursor-pointer"
-                        >
-                          <X className="w-4 h-4" />
-                        </button>
-                      </div>
+                  {onCreateTaskList && (
+                    <button
+                      type="button"
+                      onClick={() => setShowNewListModal(true)}
+                      className="inline-flex items-center space-x-1 text-xs font-medium text-neutral-700 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 border border-neutral-300 px-2 py-1.5 rounded-lg transition-colors cursor-pointer"
+                      title="Utwórz nową listę zadań Google"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">Nowa lista</span>
+                    </button>
+                  )}
 
-                      {/* 1. Lista wyboru Listy zadań z której te zadania mają być dodane */}
-                      <div>
-                        <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                          Lista zadań (źródło zadań) *
-                        </label>
-                        <select
-                          id="select-sync-source-task-list"
-                          value={syncSourceListId}
-                          onChange={(e) => setSyncSourceListId(e.target.value)}
-                          className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
-                        >
-                          <option value={ALL_TASK_LISTS_ID}>
-                            Wszystkie listy zadań ({tasks.filter((t) => t.status !== 'completed').length} aktywnych)
-                          </option>
-                          {taskLists
-                            .filter((l) => l.id !== ALL_TASK_LISTS_ID)
-                            .map((l) => {
-                              const count = tasks.filter((t) => t.taskListId === l.id && t.status !== 'completed').length;
-                              return (
-                                <option key={l.id} value={l.id}>
-                                  {l.title} ({count} {count === 1 ? 'zadanie' : count > 1 && count < 5 ? 'zadania' : 'zadań'})
-                                </option>
-                              );
-                            })}
-                        </select>
-                        <p className="text-[10px] text-neutral-500 mt-1">
-                          Wybierz listę zadań w Google Tasks, z której mają zostać dodane aktywne zadania.
-                        </p>
-                      </div>
+                  <span className="inline-flex items-center px-2 py-1 rounded text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                    Google Tasks
+                  </span>
 
-                      {/* 2. Lista wyboru docelowych kalendarzy */}
-                      <div>
-                        <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                          Docelowy Kalendarz Google *
-                        </label>
-                        <select
-                          id="select-sync-target-calendar"
-                          value={syncTargetCalendarId}
-                          onChange={(e) => setSyncTargetCalendarId(e.target.value)}
-                          className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
-                        >
-                          {calendars && calendars.length > 0 ? (
-                            calendars
-                              .filter((c) => c.id !== '_all_calendars_')
-                              .map((cal) => (
-                                <option key={cal.id} value={cal.id}>
-                                  {cal.summary
-                                    ?.replace(/\s*[([](?:główny|glowny|primary)[)\]]/gi, '')
-                                    ?.replace(/\s*-\s*(?:główny|glowny|primary)/gi, '')
-                                    ?.trim() || cal.summary}
-                                  {cal.primary ? ' (Główny)' : ''}
-                                </option>
-                              ))
-                          ) : (
-                            <option value="">Domyślny kalendarz</option>
-                          )}
-                        </select>
-                        <p className="text-[10px] text-neutral-500 mt-1">
-                          Wybierz kalendarz, do którego zostaną utworzone wydarzenia z godzinami wykonania.
-                        </p>
-                      </div>
-
-                      {/* Status / Task count preview */}
-                      <div className="p-2.5 rounded-xl bg-blue-50/80 border border-blue-200/80 flex items-center justify-between text-xs">
-                        <span className="text-neutral-700 font-medium">Aktywne zadania do utworzenia:</span>
-                        <strong className="text-blue-700 font-bold text-sm">
-                          {selectedSourceListTasks.length}
-                        </strong>
-                      </div>
-
-                      {selectedSourceListTasks.length === 0 && (
-                        <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-800">
-                          Wybrana lista nie zawiera obecnie aktywnych (niewykonanych) zadań.
-                        </div>
+                  {onSyncTasksToCalendar && (taskLists.length > 0 || tasks.length > 0) && (
+                    <button
+                      id="btn-sync-to-calendar"
+                      type="button"
+                      onClick={handleOpenSyncModal}
+                      disabled={isSyncingCalendar}
+                      className="inline-flex items-center space-x-1 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer shadow-xs disabled:opacity-50"
+                      title="Wybierz listę zadań oraz kalendarz docelowy, aby dodać zadania"
+                    >
+                      {isSyncingCalendar ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Sparkles className="w-3.5 h-3.5" />
                       )}
-
-                      {/* Actions */}
-                      <div className="flex items-center justify-end space-x-2 pt-2 border-t border-neutral-100">
-                        <button
-                          type="button"
-                          onClick={() => setShowCalendarDropdown(false)}
-                          disabled={isSyncingCalendar}
-                          className="px-3.5 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-colors cursor-pointer"
-                        >
-                          Anuluj
-                        </button>
-                        <button
-                          id="btn-confirm-sync-tasks-to-calendar"
-                          type="button"
-                          onClick={() => handleSyncToTargetCalendar(syncTargetCalendarId, syncSourceListId)}
-                          disabled={isSyncingCalendar || selectedSourceListTasks.length === 0}
-                          className="inline-flex items-center space-x-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
-                        >
-                          {isSyncingCalendar ? (
-                            <>
-                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                              <span>Dodawanie do kalendarza...</span>
-                            </>
-                          ) : (
-                            <>
-                              <Sparkles className="w-3.5 h-3.5" />
-                              <span>Dodaj do Kalendarza</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
-                    </div>
+                      <span>Do Kalendarza</span>
+                    </button>
                   )}
                 </div>
-              )}
+              </div>
+
+              {/* Date Range Filter Bar (Zakres dat) inside collapsible '...' */}
+              <DateRangeFilterBar
+                range={activeDateRange}
+                onChangeRange={handleDateRangeChange}
+                totalCount={tasks.length}
+                filteredCount={tasksMatchingDate.length}
+                accentColor="emerald"
+                includeNoDateTasks={includeNoDateTasks}
+                onToggleIncludeNoDateTasks={handleToggleIncludeNoDate}
+                noDateCount={noDateCount}
+                idPrefix="tasks-date-filter"
+              />
+
+              {/* Progress & Filters inside collapsible '...' */}
+              <div className="px-3 sm:px-4 py-2 sm:py-2.5 bg-neutral-50/60 rounded-xl border border-neutral-200/80 mt-1">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-600 min-h-[28px]">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="font-semibold text-neutral-800">
+                      {completedCount} z {totalCount} wykonanych
+                    </span>
+                    <span className="text-neutral-400">&bull;</span>
+                    <span>{progressPercent}%</span>
+                  </div>
+
+                  <div className="flex items-center space-x-1 bg-neutral-200/60 p-0.5 rounded-lg text-[11px] shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setFilter('all')}
+                      className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
+                        filter === 'all' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-600 hover:text-neutral-900'
+                      }`}
+                    >
+                      Wszystkie ({totalCount})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFilter('active')}
+                      className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
+                        filter === 'active' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-600 hover:text-neutral-900'
+                      }`}
+                    >
+                      Do zrobienia ({totalCount - completedCount})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFilter('completed')}
+                      className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
+                        filter === 'completed' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-600 hover:text-neutral-900'
+                      }`}
+                    >
+                      Ukończone ({completedCount})
+                    </button>
+                  </div>
+                </div>
+
+                {/* Progress bar */}
+                <div className="w-full bg-neutral-200/80 h-1.5 rounded-full overflow-hidden mt-1.5">
+                  <div
+                    className="bg-emerald-500 h-full transition-all duration-300 rounded-full"
+                    style={{ width: `${progressPercent}%` }}
+                  />
+                </div>
+              </div>
             </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Date Range Filter Bar (Zakres dat) */}
-      <DateRangeFilterBar
-        range={activeDateRange}
-        onChangeRange={handleDateRangeChange}
-        totalCount={tasks.length}
-        filteredCount={tasksMatchingDate.length}
-        accentColor="emerald"
-        includeNoDateTasks={includeNoDateTasks}
-        onToggleIncludeNoDateTasks={handleToggleIncludeNoDate}
-        noDateCount={noDateCount}
-        idPrefix="tasks-date-filter"
-      />
-
-      {/* Progress & Filters (Brown Box moved down below DateRangeFilterBar) */}
-      <div className="px-3 sm:px-4 py-2 sm:py-2.5 bg-neutral-50/60 border-b border-neutral-200/80">
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-600 min-h-[28px]">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <span className="font-semibold text-neutral-800">
-              {completedCount} z {totalCount} wykonanych
-            </span>
-            <span className="text-neutral-400">&bull;</span>
-            <span>{progressPercent}%</span>
-          </div>
-
-          <div className="flex items-center space-x-1 bg-neutral-200/60 p-0.5 rounded-lg text-[11px] shrink-0">
-            <button
-              type="button"
-              onClick={() => setFilter('all')}
-              className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
-                filter === 'all' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-            >
-              Wszystkie ({totalCount})
-            </button>
-            <button
-              type="button"
-              onClick={() => setFilter('active')}
-              className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
-                filter === 'active' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-            >
-              Do zrobienia ({totalCount - completedCount})
-            </button>
-            <button
-              type="button"
-              onClick={() => setFilter('completed')}
-              className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
-                filter === 'completed' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-            >
-              Ukończone ({completedCount})
-            </button>
-          </div>
-        </div>
-
-        {/* Progress bar */}
-        <div className="w-full bg-neutral-200/80 h-1.5 rounded-full overflow-hidden mt-1.5">
-          <div
-            className="bg-emerald-500 h-full transition-all duration-300 rounded-full"
-            style={{ width: `${progressPercent}%` }}
-          />
+          )}
         </div>
       </div>
 
@@ -1584,9 +1807,15 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
 
       {/* Edit Task Modal */}
       {editingTask && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-5 shadow-xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150">
-            <div className="flex items-start justify-between border-b border-neutral-100 pb-3 mb-4">
+        <div
+          className="fixed inset-0 bg-black/50 backdrop-blur-2xs z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+          onClick={() => setEditingTask(null)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-lg w-full p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150 my-auto max-h-[calc(100dvh-2rem)] flex flex-col overflow-hidden text-left"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between border-b border-neutral-100 pb-3 mb-3 shrink-0">
               <div className="flex items-center space-x-2.5">
                 <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center">
                   <Pencil className="w-4 h-4" />
@@ -1607,7 +1836,7 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
               </button>
             </div>
 
-            <form onSubmit={handleSaveEditSubmit} className="space-y-4">
+            <form onSubmit={handleSaveEditSubmit} className="space-y-4 overflow-y-auto flex-1 min-h-0 pr-1">
               <div>
                 <label className="block text-xs font-semibold text-neutral-700 mb-1">
                   Lista zadań (przypisanie)
@@ -1644,112 +1873,32 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
                 />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-neutral-700">
                     Termin wykonania (data)
                   </label>
-                  <input
-                    type="date"
-                    value={editDue}
-                    onChange={(e) => setEditDue(e.target.value)}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                    Godzina rozpoczęcia
-                  </label>
-                  <input
-                    type="time"
-                    value={editTime}
-                    onChange={(e) => setEditTime(e.target.value)}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                  Notatki (opcjonalnie)
-                </label>
-                <textarea
-                  rows={2}
-                  value={editNotes}
-                  onChange={(e) => setEditNotes(e.target.value)}
-                  placeholder="Dodatkowe informacje..."
-                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900 resize-none"
-                />
-              </div>
-
-              {onAddTaskToCalendar && (
-                <div className="space-y-2 p-2.5 rounded-lg border border-neutral-200 bg-neutral-50/80">
-                  <label className="flex items-start space-x-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={alsoAddToCalendar}
-                      onChange={(e) => setAlsoAddToCalendar(e.target.checked)}
-                      className="mt-0.5 rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
-                    />
-                    <div className="text-xs text-neutral-700">
-                      <span className="font-semibold text-neutral-900">
-                        Dodaj / Zaktualizuj termin w Kalendarzu Google (+1h)
-                      </span>
-                      <p className="text-[11px] text-neutral-500 mt-0.5">
-                        Wydarzenie o czasie trwania 1h ({editTime || '18:00'} &ndash; {calculateEndTimePlusOneHour(editTime || '18:00')}) zostanie dodane do Twojego kalendarza.
-                      </p>
-                    </div>
-                  </label>
-
-                  {alsoAddToCalendar && (
-                    <div className="pt-2 border-t border-neutral-200/60 pl-6">
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label className="text-[11px] font-semibold text-neutral-700">
-                          Kolor w Kalendarzu Google:
-                        </label>
-                        <span className="text-[10px] font-medium text-neutral-500">
-                          {GOOGLE_EVENT_COLOR_OPTIONS.find((c) => c.id === editColorId)?.name || 'Domyślny kalendarza'}
-                        </span>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => setEditColorId('')}
-                          className={`px-2 py-0.5 text-[10px] rounded border transition-all cursor-pointer ${
-                            !editColorId
-                              ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
-                              : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
-                          }`}
-                        >
-                          Domyślny
-                        </button>
-                        {GOOGLE_EVENT_COLOR_OPTIONS.map((c) => {
-                          const isSelected = editColorId === c.id;
-                          return (
-                            <button
-                              key={c.id}
-                              type="button"
-                              onClick={() => setEditColorId(c.id || '')}
-                              className={`w-5 h-5 rounded-full flex items-center justify-center transition-all cursor-pointer border ${
-                                isSelected
-                                  ? 'ring-2 ring-blue-600 ring-offset-1 scale-110 border-neutral-400'
-                                  : 'hover:scale-105 border-neutral-300/80'
-                              }`}
-                              style={{ backgroundColor: c.hex }}
-                              title={c.name}
-                            >
-                              {isSelected && (
-                                <span className="text-[9px] text-white font-black leading-none drop-shadow-xs">✓</span>
-                              )}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
+                  {editDue && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditDue('');
+                        setAlsoAddToCalendar(false);
+                      }}
+                      className="text-[10px] text-neutral-400 hover:text-rose-600 transition cursor-pointer"
+                      title="Usuń termin wykonania zadania"
+                    >
+                      Usuń termin
+                    </button>
                   )}
                 </div>
-              )}
+                <input
+                  type="date"
+                  value={editDue}
+                  onChange={(e) => setEditDue(e.target.value)}
+                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900"
+                />
+              </div>
 
               <div className="flex justify-end gap-2 pt-2 border-t border-neutral-100">
                 <button
@@ -1782,8 +1931,14 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
 
       {/* Create New Task List Modal */}
       {showNewListModal && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150">
+        <div
+          className="fixed inset-0 bg-black/50 backdrop-blur-2xs z-50 flex items-center justify-center p-4"
+          onClick={() => setShowNewListModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150 text-left"
+            onClick={(e) => e.stopPropagation()}
+          >
             <h3 className="text-base font-semibold text-neutral-900 mb-2">Utwórz nową listę zadań Google</h3>
             <p className="text-xs text-neutral-500 mb-4">
               Wpisz nazwę nowej listy zadań w Google Tasks (np. &bdquo;Projekt 2026&rdquo;, &bdquo;Zadania codzienne&rdquo;, &bdquo;Spotkania&rdquo;).
@@ -1820,9 +1975,15 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
 
       {/* Create New Task Modal */}
       {showNewTaskModal && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150">
-            <div className="flex items-center justify-between pb-3 mb-4 border-b border-neutral-100">
+        <div
+          className="fixed inset-0 bg-black/50 backdrop-blur-2xs z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+          onClick={() => setShowNewTaskModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-lg w-full p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150 my-auto max-h-[calc(100dvh-2rem)] flex flex-col overflow-hidden text-left"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 mb-3 border-b border-neutral-100 shrink-0">
               <div className="flex items-center space-x-2.5">
                 <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center">
                   <ListTodo className="w-4 h-4" />
@@ -1843,7 +2004,7 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
               </button>
             </div>
 
-            <form onSubmit={handleCreateTask} className="space-y-4">
+            <form onSubmit={handleCreateTask} className="space-y-4 overflow-y-auto flex-1 min-h-0 pr-1">
               <div>
                 <label className="block text-xs font-semibold text-neutral-700 mb-1">
                   Lista zadań (docelowa)
@@ -1881,83 +2042,34 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
                 />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-neutral-700">
                     Termin wykonania (data)
                   </label>
-                  <input
-                    type="date"
-                    value={newTaskDue}
-                    onChange={(e) => {
-                      setNewTaskDue(e.target.value);
-                      if (e.target.value && !newTaskTime) {
-                        setNewTaskTime('18:00');
-                      }
-                    }}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900"
-                  />
+                  {newTaskDue && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNewTaskDue('');
+                        setNewTaskAlsoCalendar(false);
+                      }}
+                      className="text-[10px] text-neutral-400 hover:text-rose-600 transition cursor-pointer"
+                      title="Usuń termin wykonania zadania"
+                    >
+                      Usuń termin
+                    </button>
+                  )}
                 </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                    Godzina (opcjonalnie)
-                  </label>
-                  <input
-                    type="time"
-                    value={newTaskTime}
-                    onChange={(e) => setNewTaskTime(e.target.value)}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900 font-mono"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                  Notatki (opcjonalnie)
-                </label>
-                <textarea
-                  rows={2}
-                  value={newTaskNotes}
-                  onChange={(e) => setNewTaskNotes(e.target.value)}
-                  placeholder="Dodatkowe informacje..."
-                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900 resize-none"
+                <input
+                  type="date"
+                  value={newTaskDue}
+                  onChange={(e) => setNewTaskDue(e.target.value)}
+                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white text-neutral-900"
                 />
               </div>
 
-              {onAddTaskToCalendar && newTaskDue && (
-                <label className="flex items-start space-x-2 p-2.5 rounded-lg border border-neutral-200 bg-neutral-50/80 cursor-pointer hover:bg-neutral-100/80 transition-colors">
-                  <input
-                    type="checkbox"
-                    checked={newTaskAlsoCalendar}
-                    onChange={(e) => setNewTaskAlsoCalendar(e.target.checked)}
-                    className="mt-0.5 rounded text-blue-600 focus:ring-blue-500"
-                  />
-                  <div className="text-xs text-neutral-700">
-                    <span className="font-semibold text-neutral-900">
-                      Dodaj również jako blok do Kalendarza Google
-                    </span>
-                    <p className="text-[11px] text-neutral-500 mt-0.5">
-                      Utworzy wydarzenie w kalendarzu na dzień {newTaskDue} o godz. {newTaskTime || '18:00'}.
-                    </p>
-                  </div>
-                </label>
-              )}
-
-              {/* Toggle option for including hour in Google Tasks */}
-              <div className="pt-2 border-t border-neutral-100 text-[11px] text-neutral-600">
-                <label className="flex items-center space-x-1.5 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={includeTimeInTitle}
-                    onChange={(e) => onToggleIncludeTimeInTitle?.(e.target.checked)}
-                    className="rounded text-emerald-600 focus:ring-emerald-500 w-3.5 h-3.5"
-                  />
-                  <span>Dodawaj godzinę do nazwy zadania (np. 18:00 - Pakowanie)</span>
-                </label>
-              </div>
-
-              <div className="flex justify-end gap-2 pt-2 border-t border-neutral-100">
+              <div className="flex justify-end gap-2 pt-2 border-t border-neutral-100 shrink-0">
                 <button
                   type="button"
                   onClick={() => setShowNewTaskModal(false)}
@@ -1982,6 +2094,147 @@ export const TasksListCard: React.FC<TasksListCardProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal dialog: Do Kalendarza (Sync tasks to calendar) */}
+      {showSyncModal && (
+        <div
+          className="fixed inset-0 bg-black/50 backdrop-blur-2xs z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+          onClick={() => setShowSyncModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-neutral-200 animate-in fade-in zoom-in-95 duration-150 my-auto text-left flex flex-col max-h-[calc(100dvh-2rem)] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-neutral-100 shrink-0">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-9 h-9 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
+                  <Calendar className="w-5 h-5" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-neutral-900">
+                    Dodaj zadania do kalendarza
+                  </h4>
+                  <p className="text-[11px] text-neutral-500">
+                    Wskaż listę zadań i docelowy Kalendarz Google
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowSyncModal(false)}
+                className="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3.5 py-3.5">
+              <div>
+                <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                  Lista zadań (źródło zadań) *
+                </label>
+                <select
+                  id="select-sync-source-task-list-modal"
+                  value={syncSourceListId}
+                  onChange={(e) => setSyncSourceListId(e.target.value)}
+                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
+                >
+                  <option value={ALL_TASK_LISTS_ID}>
+                    Wszystkie listy zadań ({tasks.filter((t) => t.status !== 'completed').length} aktywnych)
+                  </option>
+                  {taskLists
+                    .filter((l) => l.id !== ALL_TASK_LISTS_ID)
+                    .map((l) => {
+                      const count = tasks.filter((t) => t.taskListId === l.id && t.status !== 'completed').length;
+                      return (
+                        <option key={l.id} value={l.id}>
+                          {l.title} ({count} {count === 1 ? 'zadanie' : count > 1 && count < 5 ? 'zadania' : 'zadań'})
+                        </option>
+                      );
+                    })}
+                </select>
+                <p className="text-[10px] text-neutral-500 mt-1">
+                  Znaleziono {selectedSourceListTasks.length} {selectedSourceListTasks.length === 1 ? 'zadanie' : 'zadań'} do synchronizacji.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                  Docelowy Kalendarz Google *
+                </label>
+                <select
+                  id="select-sync-target-calendar-modal"
+                  value={syncTargetCalendarId}
+                  onChange={(e) => setSyncTargetCalendarId(e.target.value)}
+                  className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
+                >
+                  {calendars && calendars.length > 0 ? (
+                    calendars
+                      .filter((c) => c.id !== '_all_calendars_')
+                      .map((cal) => (
+                        <option key={cal.id} value={cal.id}>
+                          {cal.summary
+                            ?.replace(/\s*[([](?:główny|glowny|primary)[)\]]/gi, '')
+                            ?.replace(/\s*-\s*(?:główny|glowny|primary)/gi, '')
+                            ?.trim() || cal.summary}
+                          {cal.primary ? ' (Główny)' : ''}
+                        </option>
+                      ))
+                  ) : (
+                    <option value="">Domyślny kalendarz</option>
+                  )}
+                </select>
+                <p className="text-[10px] text-neutral-500 mt-1">
+                  Wybierz kalendarz, do którego zostaną utworzone wydarzenia z terminami.
+                </p>
+              </div>
+
+              <div className="p-2.5 rounded-xl bg-blue-50/80 border border-blue-200/80 flex items-center justify-between text-xs">
+                <span className="text-neutral-700 font-medium">Aktywne zadania do utworzenia:</span>
+                <strong className="text-blue-700 font-bold text-sm">
+                  {selectedSourceListTasks.length}
+                </strong>
+              </div>
+
+              {selectedSourceListTasks.length === 0 && (
+                <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-800">
+                  Wybrana lista nie zawiera obecnie aktywnych (niewykonanych) zadań.
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end space-x-2 pt-3 border-t border-neutral-100 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowSyncModal(false)}
+                disabled={isSyncingCalendar}
+                className="px-3.5 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-colors cursor-pointer"
+              >
+                Anuluj
+              </button>
+              <button
+                id="btn-confirm-sync-tasks-to-calendar"
+                type="button"
+                onClick={() => handleSyncToTargetCalendar(syncTargetCalendarId, syncSourceListId)}
+                disabled={isSyncingCalendar || selectedSourceListTasks.length === 0}
+                className="inline-flex items-center space-x-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                {isSyncingCalendar ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Dodawanie do kalendarza...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Dodaj do Kalendarza</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -6,6 +6,7 @@ export interface TimedEventLayout {
   heightPx: number;
   leftPercent: number;
   widthPercent: number;
+  zIndex?: number;
   startMinutes: number;
   endMinutes: number;
   durationMinutes: number;
@@ -42,10 +43,10 @@ export const computeDayTimedEventLayouts = (
       // Cap at 1440 minutes (24:00)
       endMinutes = Math.min(1440, endMinutes);
 
-      const durationMinutes = Math.max(20, endMinutes - startMinutes);
+      const durationMinutes = Math.max(15, endMinutes - startMinutes);
       const topPx = (startMinutes / 60) * pixelsPerHour;
       const heightPx = Math.max(
-        24,
+        16,
         Math.min((durationMinutes / 60) * pixelsPerHour, totalHeightPx - topPx)
       );
 
@@ -110,13 +111,14 @@ export const computeDayTimedEventLayouts = (
         ...cluster[0],
         leftPercent: 0,
         widthPercent: 100,
+        zIndex: 10,
       });
       continue;
     }
 
     if (cluster.length === 2) {
       // Exactly two overlapping events:
-      // "jeśli dwa wydarzenia są w tym samym czasie to to krótsze powinno zajmować połowę szerokości paska dnia"
+      // Wydarzenie krótsze najeżdża na dłuższe (tak jak w UI google calendar)
       const [evA, evB] = cluster;
       let longer = evA;
       let shorter = evB;
@@ -125,29 +127,33 @@ export const computeDayTimedEventLayouts = (
         longer = evB;
         shorter = evA;
       } else if (evA.durationMinutes === evB.durationMinutes) {
-        // Equal durations: earlier start gets left column
+        // Equal durations: earlier start gets base (longer), later gets overlay (shorter)
         if (evB.startMinutes < evA.startMinutes) {
           longer = evB;
           shorter = evA;
         }
       }
 
+      // Longer event sits at left: 0% with width 85% and zIndex 10
       layouts.push({
         ...longer,
         leftPercent: 0,
-        widthPercent: 50,
+        widthPercent: 85,
+        zIndex: 10,
       });
 
+      // Shorter event overlays on top of the longer event, shifted to right with higher zIndex 20
       layouts.push({
         ...shorter,
-        leftPercent: 50,
-        widthPercent: 50,
+        leftPercent: 25,
+        widthPercent: 75,
+        zIndex: 20,
       });
       continue;
     }
 
     // 3 or more overlapping events:
-    // Sort cluster by duration descending (longer events first), then start time ascending
+    // Sort cluster by duration descending (longer events first -> lower zIndex, shorter events later -> higher zIndex)
     cluster.sort((a, b) => {
       if (b.durationMinutes !== a.durationMinutes) {
         return b.durationMinutes - a.durationMinutes;
@@ -155,38 +161,16 @@ export const computeDayTimedEventLayouts = (
       return a.startMinutes - b.startMinutes;
     });
 
-    // Greedy column assignment
-    const columns: Array<Array<(typeof cluster)[0]>> = [];
-    const eventColumnMap = new Map<string, number>();
-
-    for (const item of cluster) {
-      let placedCol = -1;
-      for (let c = 0; c < columns.length; c++) {
-        const hasCollision = columns[c].some((existing) => overlaps(existing, item));
-        if (!hasCollision) {
-          columns[c].push(item);
-          placedCol = c;
-          break;
-        }
-      }
-
-      if (placedCol === -1) {
-        placedCol = columns.length;
-        columns.push([item]);
-      }
-
-      eventColumnMap.set(item.event.id, placedCol);
-    }
-
-    const totalCols = Math.max(columns.length, 2);
-    const colWidth = 100 / totalCols;
-
-    for (const item of cluster) {
-      const col = eventColumnMap.get(item.event.id) ?? 0;
+    const step = Math.min(22, Math.floor(60 / (cluster.length - 1)));
+    for (let i = 0; i < cluster.length; i++) {
+      const item = cluster[i];
+      const leftPercent = i * step;
+      const widthPercent = Math.max(50, 100 - leftPercent);
       layouts.push({
         ...item,
-        leftPercent: col * colWidth,
-        widthPercent: colWidth,
+        leftPercent,
+        widthPercent,
+        zIndex: 10 + i * 5,
       });
     }
   }

@@ -1,7 +1,8 @@
 import { TaskTemplateItem, TaskCategory, DateAnchor, TaskTemplateSet, DueDateDetails } from '../types';
 
 export const cleanTaskTitle = (title: string): string => {
-  return title.replace(/^(?:\[\d{1,2}:\d{2}\]|\d{1,2}:\d{2}\s*[-–:]?)\s*/, '').trim();
+  const cleaned = title.replace(/^(?:\[\d{1,2}:\d{2}\]|\d{1,2}:\d{2}(?:[-–:]|\s))\s*/, '').trim();
+  return cleaned || title.trim();
 };
 
 export const formatTaskTitleWithTime = (title: string, time?: string): string => {
@@ -13,9 +14,10 @@ export const formatTaskTitleWithTime = (title: string, time?: string): string =>
 export const extractTaskTitleAndTime = (
   title: string,
   taskNotes?: string,
-  templates?: TaskTemplateItem[]
+  templates?: TaskTemplateItem[],
+  taskDue?: string
 ): { time: string | null; cleanTitle: string } => {
-  const match = title.match(/^(?:\[(\d{1,2}:\d{2})\]|(\d{1,2}:\d{2})\s*[-–:]?)\s*(.+)$/);
+  const match = title.match(/^(?:\[(\d{1,2}:\d{2})\]|(\d{1,2}:\d{2})(?:[-–:]|\s))\s*(.+)$/);
   if (match) {
     return {
       time: match[1] || match[2],
@@ -23,12 +25,27 @@ export const extractTaskTitleAndTime = (
     };
   }
   if (taskNotes) {
-    const noteMatch = taskNotes.match(/(?:⏰\s*)?Godzina(?:\s*wykonania)?:\s*(\d{1,2}:\d{2})/i);
+    const noteMatch = taskNotes.match(/(?:⏰\s*)?Godzina(?:\s*wykonania|\s*rozpoczęcia)?:\s*(\d{1,2}:\d{2})/i);
     if (noteMatch) {
       return {
         time: noteMatch[1],
-        cleanTitle: title.trim(),
+        cleanTitle: cleanTaskTitle(title),
       };
+    }
+  }
+  // Check if taskDue has a non-midnight time (explicit hour in Google Tasks / To Do)
+  if (taskDue && taskDue.includes('T')) {
+    const isDateOnlyMidnight = /T00:00:00(\.000)?Z$/i.test(taskDue);
+    if (!isDateOnlyMidnight) {
+      const d = new Date(taskDue);
+      if (!isNaN(d.getTime())) {
+        const pad = (n: number) => String(n).padStart(2, '0');
+        const dueTime = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        return {
+          time: dueTime,
+          cleanTitle: cleanTaskTitle(title),
+        };
+      }
     }
   }
   const clean = cleanTaskTitle(title);

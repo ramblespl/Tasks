@@ -1,4 +1,5 @@
 import { CalendarListItem, CalendarEventItem } from '../types';
+import { refreshGoogleTokenSilently, clearStoredAuth } from './firebaseAuth';
 
 const fetchCalendarWithRetry = async (
   url: string,
@@ -6,7 +7,18 @@ const fetchCalendarWithRetry = async (
   retries = 1
 ): Promise<Response> => {
   try {
-    return await fetch(url, options);
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+      if (retries > 0) {
+        const freshToken = await refreshGoogleTokenSilently();
+        if (freshToken) {
+          const newHeaders = new Headers(options.headers || {});
+          newHeaders.set('Authorization', `Bearer ${freshToken}`);
+          return await fetch(url, { ...options, headers: newHeaders });
+        }
+      }
+    }
+    return res;
   } catch (err: any) {
     if (retries > 0) {
       await new Promise((resolve) => setTimeout(resolve, 400));
@@ -172,13 +184,13 @@ export interface CreateCalendarEventPayload {
   summary: string;
   description?: string;
   start: {
-    dateTime?: string;
-    date?: string;
+    dateTime?: string | null;
+    date?: string | null;
     timeZone?: string;
   };
   end: {
-    dateTime?: string;
-    date?: string;
+    dateTime?: string | null;
+    date?: string | null;
     timeZone?: string;
   };
   location?: string;
@@ -188,6 +200,134 @@ export interface CreateCalendarEventPayload {
     overrides?: Array<{ method: 'popup' | 'email'; minutes: number }>;
   };
 }
+
+/**
+ * Helper to compute inclusive human end date when opening all-day event in modal.
+ * Google Calendar API stores end.date as EXCLUSIVE (+1 day after the event ends).
+ * For a 1-day event on 2026-10-15, Google Calendar has start.date: "2026-10-15", end.date: "2026-10-16".
+ * This function returns "2026-10-15" so the human user sees start: 2026-10-15, end: 2026-10-15.
+ */
+export const getInclusiveAllDayEndDate = (startStr: string, endStr?: string): string => {
+  if (!startStr) return '';
+  if (!endStr || endStr <= startStr) return startStr;
+  const [y, m, d] = endStr.split('-').map(Number);
+  const prevDate = new Date(y, m - 1, d - 1);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const inclusiveStr = `${prevDate.getFullYear()}-${pad(prevDate.getMonth() + 1)}-${pad(prevDate.getDate())}`;
+  return inclusiveStr >= startStr ? inclusiveStr : startStr;
+};
+
+/**
+ * Safely builds start and end objects for Google Calendar API.
+ * - All-day: start.date = YYYY-MM-DD, end.date = exclusive date (at least start.date + 1 day).
+ *   Never sends null dateTime values, which causes "Invalid start time" in Google Calendar API.
+ * - Timed: start.dateTime = YYYY-MM-DDTHH:MM:00, end.dateTime = YYYY-MM-DDTHH:MM:00 (strictly after start),
+ *   plus resolved IANA timeZone. Never sends null date values.
+ */
+export const formatCalendarEventStartEnd = (
+  payload: {
+    startDate: string;
+    endDate?: string;
+    startTime?: string;
+    endTime?: string;
+    isAllDay: boolean;
+  },
+  _isPatch = false
+): {
+  start: { date?: string; dateTime?: string; timeZone?: string };
+  end: { date?: string; dateTime?: string; timeZone?: string };
+} => {
+  const pad = (n: number) => String(n).padStart(2, '0');
+
+  const addDaysToDateStr = (dateStr: string, days: number): string => {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const date = new Date(y, m - 1, d);
+    date.setDate(date.getDate() + days);
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  };
+
+  const normalizeDateStr = (dateStr?: string): string => {
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      const now = new Date();
+      return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    }
+    return dateStr;
+  };
+
+  const startDateStr = normalizeDateStr(payload.startDate);
+
+  if (payload.isAllDay) {
+    // In human UI, endDate is inclusive (e.g. 2026-10-15 to 2026-10-15 is a 1-day event).
+    // In Google Calendar API, end.date is EXCLUSIVE (must be strictly greater than start.date,
+    // so a 1-day event on 2026-10-15 has end.date = 2026-10-16).
+    const rawEndDate = payload.endDate ? normalizeDateStr(payload.endDate) : startDateStr;
+    const inclusiveEndDate = rawEndDate >= startDateStr ? rawEndDate : startDateStr;
+    const exclusiveEndDate = addDaysToDateStr(inclusiveEndDate, 1);
+
+    return {
+      start: {
+        date: startDateStr,
+      },
+      end: {
+        date: exclusiveEndDate,
+      },
+    };
+  } else {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Warsaw';
+
+    // Normalize start time (HH:MM)
+    let sH = 9;
+    let sM = 0;
+    if (payload.startTime && /^(\d{1,2}):(\d{1,2})$/.test(payload.startTime.trim())) {
+      const [h, m] = payload.startTime.trim().split(':').map(Number);
+      if (!isNaN(h)) sH = Math.min(23, Math.max(0, h));
+      if (!isNaN(m)) sM = Math.min(59, Math.max(0, m));
+    }
+    const startTimeStr = `${pad(sH)}:${pad(sM)}`;
+
+    // Normalize end date and time
+    let targetEndDate = payload.endDate ? normalizeDateStr(payload.endDate) : startDateStr;
+    if (targetEndDate < startDateStr) {
+      targetEndDate = startDateStr;
+    }
+
+    let eH = sH;
+    let eM = sM + 30;
+    if (eM >= 60) {
+      eH += Math.floor(eM / 60);
+      eM = eM % 60;
+    }
+
+    if (payload.endTime && /^(\d{1,2}):(\d{1,2})$/.test(payload.endTime.trim())) {
+      const [h, m] = payload.endTime.trim().split(':').map(Number);
+      if (!isNaN(h)) eH = Math.min(23, Math.max(0, h));
+      if (!isNaN(m)) eM = Math.min(59, Math.max(0, m));
+    }
+
+    let endTimeStr = `${pad(eH)}:${pad(eM)}`;
+
+    // Ensure (targetEndDate T endTimeStr) is strictly after (startDateStr T startTimeStr)
+    const startMs = new Date(`${startDateStr}T${startTimeStr}:00`).getTime();
+    const endMs = new Date(`${targetEndDate}T${endTimeStr}:00`).getTime();
+
+    if (isNaN(endMs) || endMs <= startMs) {
+      const autoEnd = new Date(startMs + 30 * 60 * 1000);
+      targetEndDate = `${autoEnd.getFullYear()}-${pad(autoEnd.getMonth() + 1)}-${pad(autoEnd.getDate())}`;
+      endTimeStr = `${pad(autoEnd.getHours())}:${pad(autoEnd.getMinutes())}`;
+    }
+
+    return {
+      start: {
+        dateTime: `${startDateStr}T${startTimeStr}:00`,
+        timeZone: tz,
+      },
+      end: {
+        dateTime: `${targetEndDate}T${endTimeStr}:00`,
+        timeZone: tz,
+      },
+    };
+  }
+};
 
 export const createCalendarEvent = async (
   token: string,
@@ -294,6 +434,82 @@ export const updateCalendarEvent = async (
     calendarId
   )}/events/${encodeURIComponent(eventId)}`;
 
+  // Clean payload start and end - strip any undefined or null properties so Google API is never given invalid values
+  const cleanStart = payload.start
+    ? Object.fromEntries(Object.entries(payload.start).filter(([_, v]) => v !== null && v !== undefined))
+    : undefined;
+  const cleanEnd = payload.end
+    ? Object.fromEntries(Object.entries(payload.end).filter(([_, v]) => v !== null && v !== undefined))
+    : undefined;
+
+  const sanitizedPayload: Partial<CreateCalendarEventPayload> = {
+    ...payload,
+    ...(cleanStart ? { start: cleanStart as any } : {}),
+    ...(cleanEnd ? { end: cleanEnd as any } : {}),
+  };
+
+  // Try fetching existing event first to perform a clean full PUT update (events.update)
+  // This seamlessly handles changing dates and transitioning between all-day and timed events
+  // without leaving conflicting old date/dateTime properties in Google Calendar
+  try {
+    const getResponse = await fetchCalendarWithRetry(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (getResponse.ok) {
+      const existingItem = await getResponse.json();
+
+      if (sanitizedPayload.summary !== undefined) existingItem.summary = sanitizedPayload.summary;
+      if (sanitizedPayload.location !== undefined) existingItem.location = sanitizedPayload.location;
+      if (sanitizedPayload.description !== undefined) existingItem.description = sanitizedPayload.description;
+      if (sanitizedPayload.colorId !== undefined) existingItem.colorId = sanitizedPayload.colorId;
+
+      if (cleanStart) {
+        existingItem.start = cleanStart;
+      }
+      if (cleanEnd) {
+        existingItem.end = cleanEnd;
+      }
+
+      const putResponse = await fetchCalendarWithRetry(url, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(existingItem),
+      });
+
+      if (putResponse.ok) {
+        const item = await putResponse.json();
+        return {
+          id: item.id,
+          summary: item.summary,
+          description: item.description,
+          start: {
+            dateTime: item.start?.dateTime,
+            date: item.start?.date,
+          },
+          end: {
+            dateTime: item.end?.dateTime,
+            date: item.end?.date,
+          },
+          location: item.location,
+          htmlLink: item.htmlLink,
+          colorId: item.colorId,
+        };
+      }
+    }
+  } catch (putErr) {
+    console.warn('PUT update fallback to PATCH:', putErr);
+  }
+
+  // Fallback to PATCH if GET/PUT was not successful
   const response = await fetchCalendarWithRetry(url, {
     method: 'PATCH',
     headers: {
@@ -301,7 +517,7 @@ export const updateCalendarEvent = async (
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(sanitizedPayload),
   });
 
   if (!response.ok) {
@@ -454,17 +670,19 @@ export const isEventLongerThan24hOrAllDay = (ev: CalendarEventItem): boolean => 
   if (!ev.start.dateTime) return true;
 
   if (ev.end?.dateTime) {
+    const startDay = ev.start.dateTime.substring(0, 10);
+    const endDay = ev.end.dateTime.substring(0, 10);
+    // Multi-day events spanning across days appear in the top all-day/multi-day bar
+    if (startDay !== endDay) {
+      const endTime = ev.end.dateTime.substring(11, 16);
+      if (endTime !== '00:00') return true;
+    }
+
     const startMs = new Date(ev.start.dateTime).getTime();
     const endMs = new Date(ev.end.dateTime).getTime();
     if (!isNaN(startMs) && !isNaN(endMs)) {
       const diffHours = (endMs - startMs) / (1000 * 60 * 60);
-      // Explicitly 24 hours or longer
       if (diffHours >= 24) return true;
-
-      // Multi-day spanning across midnight with >= 16 hours duration
-      const startDay = ev.start.dateTime.substring(0, 10);
-      const endDay = ev.end.dateTime.substring(0, 10);
-      if (startDay !== endDay && diffHours >= 16) return true;
     }
   } else if (ev.end?.date && ev.start.date) {
     return true;
@@ -475,7 +693,7 @@ export const isEventLongerThan24hOrAllDay = (ev: CalendarEventItem): boolean => 
 
 /**
  * Generates an array of YYYY-MM-DD date strings that an event spans across.
- * Useful for mapping multi-day events so they appear on all days of the event.
+ * Ensures the event bar appears on all days including start and end date.
  */
 export const getEventDateSpan = (ev: CalendarEventItem): string[] => {
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -500,10 +718,17 @@ export const getEventDateSpan = (ev: CalendarEventItem): string[] => {
   // e.g. 2026-09-18 to 2026-09-20 means Sept 18 & 19
   if (!ev.start.dateTime && ev.end?.date && endLimit > curr) {
     endLimit = new Date(endLimit.getTime() - 24 * 60 * 60 * 1000);
+  } else if (ev.end?.dateTime && ev.end.dateTime.substring(11, 16) === '00:00' && endLimit > curr) {
+    // If a timed event ends at midnight 00:00, the last day is the previous day
+    endLimit = new Date(endLimit.getTime() - 24 * 60 * 60 * 1000);
+  }
+
+  if (endLimit < curr) {
+    endLimit = new Date(curr.getTime());
   }
 
   let safety = 0;
-  while (curr <= endLimit && safety < 60) {
+  while (curr <= endLimit && safety < 90) {
     dates.push(formatDate(curr));
     curr.setDate(curr.getDate() + 1);
     safety++;

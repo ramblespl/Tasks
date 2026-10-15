@@ -1,4 +1,5 @@
 import { GoogleTaskList, GoogleTaskItem } from '../types';
+import { refreshGoogleTokenSilently, clearStoredAuth } from './firebaseAuth';
 
 const fetchTasksWithRetry = async (
   url: string,
@@ -6,7 +7,18 @@ const fetchTasksWithRetry = async (
   retries = 1
 ): Promise<Response> => {
   try {
-    return await fetch(url, options);
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+      if (retries > 0) {
+        const freshToken = await refreshGoogleTokenSilently();
+        if (freshToken) {
+          const newHeaders = new Headers(options.headers || {});
+          newHeaders.set('Authorization', `Bearer ${freshToken}`);
+          return await fetch(url, { ...options, headers: newHeaders });
+        }
+      }
+    }
+    return res;
   } catch (err: any) {
     if (retries > 0) {
       await new Promise((resolve) => setTimeout(resolve, 400));

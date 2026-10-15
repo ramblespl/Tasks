@@ -11,7 +11,14 @@ import {
   AlertCircle,
   RefreshCw,
   CheckCircle2,
+  Smartphone,
+  Check,
 } from 'lucide-react';
+import {
+  isRememberDeviceEnabled,
+  setRememberDevice,
+  getStoredAuth,
+} from '../services/firebaseAuth';
 
 interface LoginViewProps {
   onSignIn: () => void;
@@ -28,6 +35,13 @@ export const LoginView: React.FC<LoginViewProps> = ({
 }) => {
   const [showManualToken, setShowManualToken] = useState(false);
   const [manualTokenInput, setManualTokenInput] = useState('');
+  const [rememberDevice, setRememberDeviceState] = useState<boolean>(() => isRememberDeviceEnabled());
+  const savedAuth = getStoredAuth();
+
+  const handleToggleRemember = (checked: boolean) => {
+    setRememberDeviceState(checked);
+    setRememberDevice(checked);
+  };
 
   const handleManualSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -124,8 +138,47 @@ export const LoginView: React.FC<LoginViewProps> = ({
           </div>
         )}
 
+        {/* Saved session quick resume if available */}
+        {savedAuth?.user && savedAuth.user.displayName && (
+          <div className="p-3.5 bg-blue-50/70 border border-blue-200/80 rounded-2xl flex items-center justify-between gap-3 text-left animate-in fade-in">
+            <div className="flex items-center space-x-3 min-w-0">
+              {savedAuth.user.photoURL ? (
+                <img
+                  src={savedAuth.user.photoURL}
+                  alt=""
+                  className="w-9 h-9 rounded-full border border-blue-200 object-cover shrink-0"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <div className="w-9 h-9 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-sm shrink-0">
+                  {savedAuth.user.displayName[0] || 'U'}
+                </div>
+              )}
+              <div className="min-w-0">
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-xs font-bold text-neutral-900 truncate">
+                    {savedAuth.user.displayName}
+                  </span>
+                  <span className="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-medium bg-emerald-100 text-emerald-800">
+                    Zapamiętane
+                  </span>
+                </div>
+                <p className="text-[11px] text-neutral-600 truncate">{savedAuth.user.email}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onSignIn}
+              disabled={isSigningIn}
+              className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white text-xs font-semibold rounded-xl shrink-0 transition shadow-2xs cursor-pointer disabled:opacity-50"
+            >
+              Wznów &rarr;
+            </button>
+          </div>
+        )}
+
         {/* Official Google Sign-in Button */}
-        <div className="pt-2 flex flex-col items-center space-y-3">
+        <div className="pt-1 flex flex-col items-center space-y-3">
           <button
             id="btn-google-signin"
             type="button"
@@ -163,6 +216,25 @@ export const LoginView: React.FC<LoginViewProps> = ({
               </>
             )}
           </button>
+
+          {/* Zapamiętaj logowanie na tym urządzeniu Checkbox */}
+          <div className="w-full max-w-sm pt-1 pb-1">
+            <label className="flex items-center justify-center space-x-2 text-xs text-neutral-700 hover:text-neutral-900 cursor-pointer select-none">
+              <input
+                id="checkbox-remember-device"
+                type="checkbox"
+                checked={rememberDevice}
+                onChange={(e) => handleToggleRemember(e.target.checked)}
+                className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+              />
+              <span className="font-medium text-neutral-800">
+                Zapamiętaj logowanie na tym urządzeniu
+              </span>
+            </label>
+            <p className="text-[11px] text-neutral-500 text-center leading-snug mt-1">
+              Sesja i autoryzacja Google Calendar oraz Tasks pozostaną aktywne przy kolejnych wizytach.
+            </p>
+          </div>
 
           {isIframe && (
             <div className="flex items-center space-x-1.5 text-xs text-blue-600 hover:text-blue-700">
