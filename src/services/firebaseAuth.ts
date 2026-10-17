@@ -10,7 +10,7 @@ import {
   signOut,
   type User,
 } from 'firebase/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
+import { authConfig, getOAuthClientId, loadRuntimeConfig } from '../config/authConfig';
 import { GoogleUser } from '../types';
 
 declare global {
@@ -40,7 +40,7 @@ declare global {
   }
 }
 
-export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+export const app = getApps().length === 0 ? initializeApp(authConfig) : getApp();
 export const auth = getAuth(app);
 
 // Enable local device persistence for Firebase Authentication
@@ -96,7 +96,7 @@ export const setRememberDevice = (remember: boolean) => {
 
 export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds = 3600) => {
   try {
-    const currentClientId = (firebaseConfig as Record<string, any>).oAuthClientId || '';
+    const currentClientId = getOAuthClientId() || '';
     const expiresAt = Date.now() + Math.max(300, expiresInSeconds) * 1000;
     // Always persist to localStorage so reopening the app or browser never asks to log in again
     localStorage.setItem(STORAGE_KEY_TOKEN, token);
@@ -123,7 +123,7 @@ export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds
 
 export const getStoredAuth = (): { token: string; user: GoogleUser; isConsentGranted: boolean } | null => {
   try {
-    const currentClientId = (firebaseConfig as Record<string, any>).oAuthClientId || '';
+    const currentClientId = getOAuthClientId() || '';
     const savedClientId =
       localStorage.getItem(STORAGE_KEY_CLIENT_ID) ||
       sessionStorage.getItem(STORAGE_KEY_CLIENT_ID);
@@ -277,9 +277,7 @@ export const refreshGoogleTokenSilently = async (): Promise<string | null> => {
   }
   lastSilentRefreshAttempt = now;
 
-  const clientId =
-    (firebaseConfig as Record<string, any>).oAuthClientId ||
-    (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID;
+  const clientId = getOAuthClientId();
   if (!clientId) return null;
 
   isRefreshingToken = true;
@@ -379,6 +377,9 @@ export const initAuth = (
   onAuthSuccess?: (user: GoogleUser, token: string) => void,
   onAuthFailure?: () => void
 ) => {
+  // Fetch runtime configuration if served via Docker/Express with environment variables
+  loadRuntimeConfig().catch(() => {});
+
   // Check stored session in localStorage/sessionStorage for automatic resume
   const stored = getStoredAuth();
   if (stored && stored.token && stored.user) {
@@ -442,9 +443,9 @@ const signInWithGsi = async (options?: { prompt?: string }): Promise<{
     throw new Error('GSI_NOT_AVAILABLE');
   }
 
-  const clientId = (firebaseConfig as Record<string, any>).oAuthClientId || (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID;
+  const clientId = getOAuthClientId();
   if (!clientId) {
-    throw new Error('Brak skonfigurowanego oAuthClientId.');
+    throw new Error('Brak skonfigurowanego oAuthClientId. Ustaw zmienną środowiskową VITE_GOOGLE_OAUTH_CLIENT_ID lub skonfiguruj integrację OAuth.');
   }
 
   return new Promise((resolve, reject) => {

@@ -7,10 +7,10 @@ import {
   Unsubscribe,
 } from 'firebase/firestore';
 import { app, auth } from './firebaseAuth';
-import firebaseConfig from '../../firebase-applet-config.json';
+import { authConfig } from '../config/authConfig';
 import { TaskTemplateSet } from '../types';
 
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const db = getFirestore(app, authConfig.firestoreDatabaseId);
 
 export enum OperationType {
   CREATE = 'create',
