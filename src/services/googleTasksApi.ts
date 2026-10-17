@@ -30,6 +30,43 @@ const fetchTasksWithRetry = async (
   }
 };
 
+export const parseGoogleTasksError = async (
+  response: Response,
+  actionDesc: string
+): Promise<Error> => {
+  const errorData = await response.json().catch(() => ({}));
+  const apiMessage = errorData.error?.message || '';
+  const reason = errorData.error?.errors?.[0]?.reason || '';
+
+  if (response.status === 401) {
+    return new Error('Sesja Google wygasła (401). Zaloguj się ponownie, aby odświeżyć uprawnienia.');
+  }
+
+  if (response.status === 403) {
+    if (
+      apiMessage.includes('has not been used') ||
+      apiMessage.includes('disabled') ||
+      reason === 'accessNotConfigured'
+    ) {
+      return new Error(
+        `Google Tasks API nie jest aktywne w projekcie Google Cloud (403): ${apiMessage}. Wymagana konfiguracja OAuth / API w projekcie.`
+      );
+    }
+    if (apiMessage.includes('insufficient') || reason === 'insufficientPermissions') {
+      return new Error(
+        `Brak uprawnień OAuth (403): ${apiMessage}. Zaloguj się ponownie i zaznacz wszystkie pola wyboru zgody Google.`
+      );
+    }
+    return new Error(
+      apiMessage
+        ? `Błąd uprawnień Google Tasks (403): ${apiMessage}`
+        : `${actionDesc}: brak uprawnień (403). Sprawdź uprawnienia do Google Tasks.`
+    );
+  }
+
+  return new Error(apiMessage || `${actionDesc} (${response.status})`);
+};
+
 export const listTaskLists = async (token: string): Promise<GoogleTaskList[]> => {
   if (!token || !token.trim()) {
     throw new Error('Brak tokenu autoryzacji Google. Zaloguj się ponownie.');
@@ -43,18 +80,7 @@ export const listTaskLists = async (token: string): Promise<GoogleTaskList[]> =>
   });
 
   if (!response.ok) {
-    if (response.status === 401) {
-      throw new Error('Sesja Google wygasła (401). Zaloguj się ponownie, aby odświeżyć uprawnienia.');
-    }
-    if (response.status === 403) {
-      throw new Error(
-        'Brak uprawnień do Google Tasks (403). Zaloguj się ponownie i zaznacz zgodę na dostęp do zadań.'
-      );
-    }
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(
-      errorData.error?.message || `Nie udało się pobrać list zadań Google (${response.status})`
-    );
+    throw await parseGoogleTasksError(response, 'Nie udało się pobrać list zadań Google');
   }
 
   const data = await response.json();

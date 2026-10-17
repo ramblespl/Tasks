@@ -30,6 +30,43 @@ const fetchCalendarWithRetry = async (
   }
 };
 
+export const parseGoogleCalendarError = async (
+  response: Response,
+  actionDesc: string
+): Promise<Error> => {
+  const errorData = await response.json().catch(() => ({}));
+  const apiMessage = errorData.error?.message || '';
+  const reason = errorData.error?.errors?.[0]?.reason || '';
+
+  if (response.status === 401) {
+    return new Error('Sesja Google wygasła (401). Zaloguj się ponownie, aby odświeżyć uprawnienia.');
+  }
+
+  if (response.status === 403) {
+    if (
+      apiMessage.includes('has not been used') ||
+      apiMessage.includes('disabled') ||
+      reason === 'accessNotConfigured'
+    ) {
+      return new Error(
+        `Google Calendar API nie jest aktywne w projekcie Google Cloud (403): ${apiMessage}. Wymagana konfiguracja OAuth / API w projekcie.`
+      );
+    }
+    if (apiMessage.includes('insufficient') || reason === 'insufficientPermissions') {
+      return new Error(
+        `Brak uprawnień OAuth (403): ${apiMessage}. Zaloguj się ponownie i zaznacz wszystkie pola wyboru zgody Google.`
+      );
+    }
+    return new Error(
+      apiMessage
+        ? `Błąd uprawnień Google Calendar (403): ${apiMessage}`
+        : `${actionDesc}: brak uprawnień (403). Sprawdź uprawnienia do Google Calendar.`
+    );
+  }
+
+  return new Error(apiMessage || `${actionDesc} (${response.status})`);
+};
+
 export const listUserCalendars = async (token: string): Promise<CalendarListItem[]> => {
   if (!token || !token.trim()) {
     throw new Error('Brak tokenu autoryzacji Google. Zaloguj się ponownie.');
@@ -46,18 +83,7 @@ export const listUserCalendars = async (token: string): Promise<CalendarListItem
   );
 
   if (!response.ok) {
-    if (response.status === 401) {
-      throw new Error('Sesja Google wygasła (401). Zaloguj się ponownie, aby odświeżyć uprawnienia.');
-    }
-    if (response.status === 403) {
-      throw new Error(
-        'Brak uprawnień do odczytu kalendarza (403). Zaloguj się ponownie i zaznacz zgodę na dostęp do Google Calendar.'
-      );
-    }
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(
-      errorData.error?.message || `Nie udało się pobrać listy kalendarzy (${response.status})`
-    );
+    throw await parseGoogleCalendarError(response, 'Nie udało się pobrać listy kalendarzy');
   }
 
   const data = await response.json();
@@ -138,18 +164,7 @@ export const getCalendarEvents = async (
     });
 
     if (!response.ok) {
-      if (response.status === 401) {
-        throw new Error('Sesja Google wygasła (401). Zaloguj się ponownie.');
-      }
-      if (response.status === 403) {
-        throw new Error(
-          'Brak uprawnień do odczytu kalendarza (403). Zaloguj się ponownie i zaznacz zgodę na dostęp do Google Calendar.'
-        );
-      }
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(
-        errorData.error?.message || `Nie udało się pobrać wydarzeń z kalendarza (${response.status})`
-      );
+      throw await parseGoogleCalendarError(response, 'Nie udało się pobrać wydarzeń z kalendarza');
     }
 
     const data = await response.json();

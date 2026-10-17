@@ -234,6 +234,9 @@ export const LoginView: React.FC<LoginViewProps> = ({
             <p className="text-[11px] text-neutral-500 text-center leading-snug mt-1">
               Sesja i autoryzacja Google Calendar oraz Tasks pozostaną aktywne przy kolejnych wizytach.
             </p>
+            <div className="mt-2 p-2.5 rounded-xl bg-blue-50/80 border border-blue-200/70 text-[11px] text-blue-900 text-center leading-snug">
+              <span className="font-bold">Ważne:</span> Na ekranie logowania Google zaznacz pola wyboru (<span className="font-semibold">Kalendarz</span> oraz <span className="font-semibold">Zadania</span>), aby nadać uprawnienia do synchronizacji.
+            </div>
           </div>
 
           {isIframe && (

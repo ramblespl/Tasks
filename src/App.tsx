@@ -107,7 +107,7 @@ import {
   resetWidgetConfig,
   DEFAULT_WIDGET_CONFIGS,
 } from './services/widgetStorage';
-import { Columns, Rows, Calendar as CalendarIcon, LayoutDashboard, Layers, ListTodo, Sliders, X, Smartphone } from 'lucide-react';
+import { Columns, Rows, Calendar as CalendarIcon, LayoutDashboard, Layers, ListTodo, Sliders, X, Smartphone, AlertCircle, RefreshCw } from 'lucide-react';
 import {
   DateRangeState,
   getDefaultDateRange,
@@ -676,7 +676,7 @@ export default function App() {
     try {
       setIsSigningIn(true);
       setAuthError(null);
-      const res = await googleSignIn();
+      const res = await googleSignIn({ prompt: 'consent' });
       if (res) {
         setUser(res.user);
         setToken(res.accessToken);
@@ -2599,6 +2599,35 @@ export default function App() {
         onToggleSidebar={handleToggleAppSidebar}
         onOpenWidgetsModal={() => setShowWidgetsModal(true)}
       />
+
+      {/* Missing Permissions Banner (403 recovery) */}
+      {(calendarPermissionError || tasksPermissionError) && user && (
+        <div className="bg-rose-600 text-white px-3 sm:px-4 py-2.5 flex items-center justify-between gap-3 text-xs sm:text-sm font-medium shadow-md shrink-0 z-40 border-b border-rose-700 animate-in slide-in-from-top-1">
+          <div className="flex items-center space-x-2.5 min-w-0">
+            <AlertCircle className="w-5 h-5 shrink-0 text-white" />
+            <div className="min-w-0">
+              <span className="font-bold">Brak uprawnień Google (403): </span>
+              <span className="text-rose-100">
+                {calendarPermissionError && tasksPermissionError
+                  ? 'Brak uprawnień do Kalendarza i Zadań Google.'
+                  : calendarPermissionError
+                    ? 'Brak uprawnień do Kalendarza Google.'
+                    : 'Brak uprawnień do Zadań Google.'}{' '}
+                Podczas logowania należy zaznaczyć oba pola wyboru na ekranie zgody Google.
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleReauthorizeGoogle}
+            disabled={isSigningIn}
+            className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 bg-white hover:bg-rose-50 text-rose-900 rounded-lg text-xs font-bold transition shadow-xs cursor-pointer active:scale-95 shrink-0"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isSigningIn ? 'animate-spin' : ''}`} />
+            <span>Nadaj uprawnienia (ekran zgody)</span>
+          </button>
+        </div>
+      )}
 
       {/* Session Expired Banner with One-Click Reauthorization */}
       {isSessionExpired && user && (

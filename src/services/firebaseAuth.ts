@@ -54,6 +54,7 @@ try {
 
 export const SCOPES = [
   'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/tasks',
   'email',
   'profile',
@@ -65,6 +66,7 @@ export const STORAGE_KEY_EXPIRES_AT = 'travel_google_auth_expires_at';
 export const STORAGE_KEY_USER = 'travel_google_auth_user';
 export const STORAGE_KEY_CONSENT = 'travel_google_auth_consent_granted';
 export const STORAGE_KEY_REMEMBER_DEVICE = 'travel_google_auth_remember_device';
+export const STORAGE_KEY_CLIENT_ID = 'travel_google_auth_client_id';
 
 const ALL_STORAGE_KEYS = [
   STORAGE_KEY_TOKEN,
@@ -72,6 +74,7 @@ const ALL_STORAGE_KEYS = [
   STORAGE_KEY_USER,
   STORAGE_KEY_CONSENT,
   STORAGE_KEY_REMEMBER_DEVICE,
+  STORAGE_KEY_CLIENT_ID,
 ];
 
 export const isRememberDeviceEnabled = (): boolean => {
@@ -93,6 +96,7 @@ export const setRememberDevice = (remember: boolean) => {
 
 export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds = 3600) => {
   try {
+    const currentClientId = (firebaseConfig as Record<string, any>).oAuthClientId || '';
     const expiresAt = Date.now() + Math.max(300, expiresInSeconds) * 1000;
     // Always persist to localStorage so reopening the app or browser never asks to log in again
     localStorage.setItem(STORAGE_KEY_TOKEN, token);
@@ -100,12 +104,18 @@ export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds
     localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
     localStorage.setItem(STORAGE_KEY_CONSENT, 'true');
     localStorage.setItem(STORAGE_KEY_REMEMBER_DEVICE, 'true');
+    if (currentClientId) {
+      localStorage.setItem(STORAGE_KEY_CLIENT_ID, currentClientId);
+    }
 
     // Also mirror to sessionStorage
     sessionStorage.setItem(STORAGE_KEY_TOKEN, token);
     sessionStorage.setItem(STORAGE_KEY_EXPIRES_AT, String(expiresAt));
     sessionStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
     sessionStorage.setItem(STORAGE_KEY_CONSENT, 'true');
+    if (currentClientId) {
+      sessionStorage.setItem(STORAGE_KEY_CLIENT_ID, currentClientId);
+    }
   } catch (err) {
     console.warn('Nie udało się zapisać sesji w pamięci urządzenia:', err);
   }
@@ -113,6 +123,19 @@ export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds
 
 export const getStoredAuth = (): { token: string; user: GoogleUser; isConsentGranted: boolean } | null => {
   try {
+    const currentClientId = (firebaseConfig as Record<string, any>).oAuthClientId || '';
+    const savedClientId =
+      localStorage.getItem(STORAGE_KEY_CLIENT_ID) ||
+      sessionStorage.getItem(STORAGE_KEY_CLIENT_ID);
+
+    // If client ID changed due to OAuth configuration update, invalidate old token
+    if (savedClientId && currentClientId && savedClientId !== currentClientId) {
+      console.log('Wykryto zmianę OAuth Client ID projektu. Unieważnianie starego tokenu.');
+      localStorage.removeItem(STORAGE_KEY_TOKEN);
+      sessionStorage.removeItem(STORAGE_KEY_TOKEN);
+      return null;
+    }
+
     const token =
       localStorage.getItem(STORAGE_KEY_TOKEN) ||
       sessionStorage.getItem(STORAGE_KEY_TOKEN);
@@ -460,10 +483,16 @@ const signInWithGsi = async (options?: { prompt?: string }): Promise<{
           // Check granted scopes if returned by GSI
           if (response.scope) {
             const scopeStr = response.scope.toLowerCase();
-            if (!scopeStr.includes('calendar')) {
-              console.warn(
-                'Uwaga: Na ekranie zgody Google nie zaznaczono uprawnień do Kalendarza!'
-              );
+            const hasCalendar = scopeStr.includes('calendar');
+            const hasTasks = scopeStr.includes('tasks');
+            if (!hasCalendar || !hasTasks) {
+              const missingParts: string[] = [];
+              if (!hasCalendar) missingParts.push('Kalendarz Google');
+              if (!hasTasks) missingParts.push('Zadania Google (Tasks)');
+              const msg = `Na ekranie logowania Google nie zaznaczono uprawnień do: ${missingParts.join(' oraz ')}. Zaloguj się ponownie i zaznacz wszystkie pola wyboru na ekranie zgody Google, aby aplikacja mogła odczytywać i zapisywać dane.`;
+              console.warn(msg);
+              reject(new Error(msg));
+              return;
             }
           }
 
@@ -523,9 +552,8 @@ const signInWithGsi = async (options?: { prompt?: string }): Promise<{
         },
       });
 
-      // If consent was previously granted, default prompt to '' (or select_account) to avoid re-prompting consent
-      const alreadyGranted = hasConsentGranted();
-      const promptMode = options?.prompt ?? (alreadyGranted ? '' : 'consent');
+      // Always present the consent screen on user-initiated sign in so permissions can be granted
+      const promptMode = options?.prompt ?? 'consent';
       tokenClient.requestAccessToken({ prompt: promptMode });
     } catch (err: any) {
       if (resolved) return;
