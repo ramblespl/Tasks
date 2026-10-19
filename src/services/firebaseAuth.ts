@@ -10,7 +10,7 @@ import {
   signOut,
   type User,
 } from 'firebase/auth';
-import { authConfig, getOAuthClientId, loadRuntimeConfig } from '../config/authConfig';
+import { authConfig, getOAuthClientId, loadRuntimeConfig, getStaticGoogleToken } from '../config/authConfig';
 import { GoogleUser } from '../types';
 
 declare global {
@@ -67,6 +67,7 @@ export const STORAGE_KEY_USER = 'travel_google_auth_user';
 export const STORAGE_KEY_CONSENT = 'travel_google_auth_consent_granted';
 export const STORAGE_KEY_REMEMBER_DEVICE = 'travel_google_auth_remember_device';
 export const STORAGE_KEY_CLIENT_ID = 'travel_google_auth_client_id';
+export const STORAGE_KEY_PERMANENT = 'travel_google_auth_permanent';
 
 const ALL_STORAGE_KEYS = [
   STORAGE_KEY_TOKEN,
@@ -75,7 +76,20 @@ const ALL_STORAGE_KEYS = [
   STORAGE_KEY_CONSENT,
   STORAGE_KEY_REMEMBER_DEVICE,
   STORAGE_KEY_CLIENT_ID,
+  STORAGE_KEY_PERMANENT,
 ];
+
+export const isPermanentTokenActive = (): boolean => {
+  try {
+    if (getStaticGoogleToken()) return true;
+    return (
+      localStorage.getItem(STORAGE_KEY_PERMANENT) === 'true' ||
+      sessionStorage.getItem(STORAGE_KEY_PERMANENT) === 'true'
+    );
+  } catch {
+    return false;
+  }
+};
 
 export const isRememberDeviceEnabled = (): boolean => {
   try {
@@ -94,16 +108,29 @@ export const setRememberDevice = (remember: boolean) => {
   }
 };
 
-export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds = 3600) => {
+export const saveStoredAuth = (
+  token: string,
+  user: GoogleUser,
+  expiresInSeconds = 3600,
+  isPermanent = false
+) => {
   try {
     const currentClientId = getOAuthClientId() || '';
-    const expiresAt = Date.now() + Math.max(300, expiresInSeconds) * 1000;
+    const isPerm = isPermanent || isPermanentTokenActive();
+    // For permanent tokens, set 1-year duration so expiry checks never expire it
+    const effectiveExpires = isPerm ? 365 * 24 * 3600 : expiresInSeconds;
+    const expiresAt = Date.now() + Math.max(300, effectiveExpires) * 1000;
+
     // Always persist to localStorage so reopening the app or browser never asks to log in again
     localStorage.setItem(STORAGE_KEY_TOKEN, token);
     localStorage.setItem(STORAGE_KEY_EXPIRES_AT, String(expiresAt));
     localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
     localStorage.setItem(STORAGE_KEY_CONSENT, 'true');
     localStorage.setItem(STORAGE_KEY_REMEMBER_DEVICE, 'true');
+    if (isPerm) {
+      localStorage.setItem(STORAGE_KEY_PERMANENT, 'true');
+      sessionStorage.setItem(STORAGE_KEY_PERMANENT, 'true');
+    }
     if (currentClientId) {
       localStorage.setItem(STORAGE_KEY_CLIENT_ID, currentClientId);
     }
@@ -113,6 +140,9 @@ export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds
     sessionStorage.setItem(STORAGE_KEY_EXPIRES_AT, String(expiresAt));
     sessionStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
     sessionStorage.setItem(STORAGE_KEY_CONSENT, 'true');
+    if (isPerm) {
+      sessionStorage.setItem(STORAGE_KEY_PERMANENT, 'true');
+    }
     if (currentClientId) {
       sessionStorage.setItem(STORAGE_KEY_CLIENT_ID, currentClientId);
     }
@@ -123,6 +153,20 @@ export const saveStoredAuth = (token: string, user: GoogleUser, expiresInSeconds
 
 export const getStoredAuth = (): { token: string; user: GoogleUser; isConsentGranted: boolean } | null => {
   try {
+    // 1. Static permanent token defined via environment variables
+    const staticToken = getStaticGoogleToken();
+    if (staticToken) {
+      const user: GoogleUser = {
+        uid: 'google-static-token',
+        displayName: 'Konto Google (Stały token)',
+        email: '',
+        photoURL: null,
+      };
+      cachedAccessToken = staticToken;
+      cachedUser = user;
+      return { token: staticToken, user, isConsentGranted: true };
+    }
+
     const currentClientId = getOAuthClientId() || '';
     const savedClientId =
       localStorage.getItem(STORAGE_KEY_CLIENT_ID) ||
@@ -252,27 +296,41 @@ let lastSilentRefreshAttempt = 0;
 
 export const isStoredTokenExpired = (): boolean => {
   try {
+    // Permanent tokens never expire
+    if (isPermanentTokenActive()) return false;
+
     const expiresAt = Number(
       localStorage.getItem(STORAGE_KEY_EXPIRES_AT) ||
         sessionStorage.getItem(STORAGE_KEY_EXPIRES_AT) ||
         0
     );
-    // Token is considered expired if expiresAt is 0 or less than 2 minutes remaining
-    return expiresAt === 0 || Date.now() >= expiresAt - 120000;
+    // If expiresAt is 0, don't prematurely lock out the user
+    if (expiresAt === 0) return false;
+    return Date.now() >= expiresAt;
   } catch {
-    return true;
+    return false;
   }
 };
 
 // Silent Google OAuth token refresh in background (without popup if previously authorized)
 export const refreshGoogleTokenSilently = async (): Promise<string | null> => {
+  // If permanent token is in use, renewal is never needed
+  if (isPermanentTokenActive()) {
+    return cachedAccessToken || getStoredAuth()?.token || null;
+  }
+
+  // Inside iframe, background silent GIS requests trigger popup blocker errors because browsers block third-party cookies & popups without user gesture.
+  if (typeof window !== 'undefined' && window.self !== window.top) {
+    return cachedAccessToken || getStoredAuth()?.token || null;
+  }
+
   if (isRefreshingToken && tokenRefreshPromise) {
     return tokenRefreshPromise;
   }
 
-  // Cooldown to avoid hammering GIS and triggering continuous focus/blur cycles
+  // Cooldown to avoid hammering GIS
   const now = Date.now();
-  if (now - lastSilentRefreshAttempt < 45000) {
+  if (now - lastSilentRefreshAttempt < 60000) {
     return cachedAccessToken;
   }
   lastSilentRefreshAttempt = now;
@@ -378,7 +436,20 @@ export const initAuth = (
   onAuthFailure?: () => void
 ) => {
   // Fetch runtime configuration if served via Docker/Express with environment variables
-  loadRuntimeConfig().catch(() => {});
+  loadRuntimeConfig()
+    .then(() => {
+      const staticToken = getStaticGoogleToken();
+      if (staticToken && !cachedAccessToken) {
+        setManualAccessToken(staticToken, true)
+          .then((u) => {
+            if (onAuthSuccess) onAuthSuccess(u, staticToken);
+          })
+          .catch((err) => {
+            console.warn('Nie udało się zainicjalizować stałego tokenu z konfiguracji:', err);
+          });
+      }
+    })
+    .catch(() => {});
 
   // Check stored session in localStorage/sessionStorage for automatic resume
   const stored = getStoredAuth();
@@ -389,21 +460,6 @@ export const initAuth = (
     if (onAuthSuccess) {
       onAuthSuccess(stored.user, stored.token);
     }
-
-    // Always attempt silent background token refresh to ensure the token remains fresh
-    refreshGoogleTokenSilently()
-      .then((freshToken) => {
-        if (freshToken && onAuthSuccess) {
-          cachedAccessToken = freshToken;
-          cachedUser = stored.user;
-          saveStoredAuth(freshToken, stored.user);
-          notifyListeners(stored.user);
-          onAuthSuccess(stored.user, freshToken);
-        }
-      })
-      .catch((err) => {
-        console.warn('Ciche odświeżenie tokenu Google w tle (kontynuacja z istniejącą sesją):', err);
-      });
   }
 
   return onAuthStateChanged(auth, async (firebaseUser: User | null) => {
@@ -636,8 +692,8 @@ export const googleSignIn = async (options?: { prompt?: string }): Promise<{
   }
 };
 
-// Manual token connection helper (for testing or restricted corporate environments)
-export const setManualAccessToken = async (token: string): Promise<GoogleUser> => {
+// Manual token connection helper with permanent token support (no hourly expiration)
+export const setManualAccessToken = async (token: string, permanent = true): Promise<GoogleUser> => {
   if (!token || !token.trim()) {
     throw new Error('Podaj poprawny token OAuth.');
   }
@@ -654,13 +710,15 @@ export const setManualAccessToken = async (token: string): Promise<GoogleUser> =
   const info = await userRes.json();
   const user: GoogleUser = {
     uid: info.sub || `manual-${Date.now()}`,
-    displayName: info.name || info.email || 'Użytkownik Google',
+    displayName: info.name || info.email || 'Użytkownik Google (Stały token)',
     email: info.email || '',
     photoURL: info.picture,
   };
 
   cachedAccessToken = cleanToken;
   cachedUser = user;
+  // Permanent tokens are persisted with 1-year duration and permanent flag
+  saveStoredAuth(cleanToken, user, 365 * 24 * 3600, permanent);
   notifyListeners(user);
   return user;
 };

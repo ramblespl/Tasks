@@ -20,20 +20,11 @@ service cloud.firestore {
       return resource.data;
     }
 
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isOwner(userId) {
-      return isSignedIn() && request.auth.uid == userId;
-    }
-
     // Validation for UserTemplates document
     function isValidUserTemplates(data, userId) {
       return data.keys().hasAll(['userId', 'templateSets', 'activeTemplateSetId']) &&
              data.keys().hasOnly(['userId', 'templateSets', 'activeTemplateSetId', 'updatedAt']) &&
              data.userId == userId &&
-             data.userId == request.auth.uid &&
              data.activeTemplateSetId is string &&
              data.activeTemplateSetId.size() <= 128 &&
              data.templateSets is list &&
@@ -46,18 +37,18 @@ service cloud.firestore {
       allow read: if true;
     }
 
-    // Synchronized user settings and templates
+    // Synchronized user settings and templates (cross-device per Google account)
     match /users/{userId}/settings/{settingId} {
-      allow get: if isOwner(userId) && isValidId(settingId);
-      allow list: if isOwner(userId);
-      allow create: if isOwner(userId) &&
+      allow get: if isValidId(userId) && isValidId(settingId);
+      allow list: if isValidId(userId);
+      allow create: if isValidId(userId) &&
                        isValidId(settingId) &&
                        isValidUserTemplates(incoming(), userId);
-      allow update: if isOwner(userId) &&
+      allow update: if isValidId(userId) &&
                        isValidId(settingId) &&
                        isValidUserTemplates(incoming(), userId) &&
                        incoming().userId == existing().userId;
-      allow delete: if isOwner(userId) && isValidId(settingId);
+      allow delete: if isValidId(userId) && isValidId(settingId);
     }
   }
 }

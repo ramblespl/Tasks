@@ -18,6 +18,7 @@ import {
   getStoredAuth,
   refreshGoogleTokenSilently,
   isStoredTokenExpired,
+  isPermanentTokenActive,
   auth,
 } from './services/firebaseAuth';
 import {
@@ -35,6 +36,7 @@ import {
   loadCloudTemplates,
   saveCloudTemplates,
   subscribeToCloudTemplates,
+  getGoogleAccountSyncKey,
 } from './services/firestoreStorage';
 import {
   listUserCalendars,
@@ -136,7 +138,8 @@ export default function App() {
   });
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [isSessionExpired, setIsSessionExpired] = useState<boolean>(() => isStoredTokenExpired() && !!getStoredAuth()?.token);
+  // Session expired is never shown on initial load; background refresh or persistent token keeps session continuous
+  const [isSessionExpired, setIsSessionExpired] = useState<boolean>(false);
 
   // Calendars & Events state - initialized from offline cache for instant display
   const [calendars, setCalendars] = useState<CalendarListItem[]>(() => getCachedCalendars());
@@ -299,15 +302,15 @@ export default function App() {
     }
   }, []);
 
-  // --- Cloud (Firestore) Templates Synchronization Across All Devices ---
+  // --- Cloud (Firestore) Templates Synchronization Across All Devices for the Google Account ---
   useEffect(() => {
-    const syncUserId = auth.currentUser?.uid || user?.uid;
-    if (!syncUserId) return;
+    const syncAccountKey = getGoogleAccountSyncKey(user) || getGoogleAccountSyncKey(getStoredAuth()?.user);
+    if (!syncAccountKey) return;
 
     let isMounted = true;
 
-    // 1. Initial fetch from Firestore
-    loadCloudTemplates(syncUserId)
+    // 1. Initial fetch from Firestore for this Google Account
+    loadCloudTemplates(syncAccountKey)
       .then((cloudData) => {
         if (!isMounted) return;
         if (cloudData && Array.isArray(cloudData.templateSets) && cloudData.templateSets.length > 0) {
@@ -321,12 +324,12 @@ export default function App() {
               cloudData.templateSets[0];
             setTemplates(active.templates || []);
           }
-          addLog('Pomyślnie zsynchronizowano szablony zadań z chmury (Firestore)', 'info');
+          addLog(`Pomyślnie zsynchronizowano szablony zadań z kontem Google (${user?.email || 'chmura'})`, 'info');
         } else {
-          // If Firestore is empty for this user, upload the current local template sets
+          // If Firestore is empty for this Google Account, upload the current local template sets
           const currentSets = loadTemplateSets();
           const currentActiveId = getActiveTemplateSetId();
-          saveCloudTemplates(syncUserId, currentSets, currentActiveId).catch((err) => {
+          saveCloudTemplates(syncAccountKey, currentSets, currentActiveId).catch((err) => {
             console.warn('Nie udało się zapisać początkowych szablonów w chmurze:', err);
           });
         }
@@ -335,9 +338,9 @@ export default function App() {
         console.warn('Błąd pobierania szablonów z Firestore:', err);
       });
 
-    // 2. Real-time subscription for changes across devices
+    // 2. Real-time subscription across devices
     const unsubscribe = subscribeToCloudTemplates(
-      syncUserId,
+      syncAccountKey,
       (cloudData) => {
         if (!isMounted) return;
         if (cloudData && Array.isArray(cloudData.templateSets) && cloudData.templateSets.length > 0) {
@@ -362,7 +365,7 @@ export default function App() {
       isMounted = false;
       unsubscribe();
     };
-  }, [user?.uid, auth.currentUser?.uid]);
+  }, [user?.email, user?.uid]);
 
   // Auto-sync & Activity logs
   const [autoSync, setAutoSync] = useState(true);
@@ -691,15 +694,23 @@ export default function App() {
     }
   };
 
-  // Handle Manual Access Token
-  const handleManualToken = async (manualToken: string) => {
+  // Handle Manual Access Token (with permanent token support)
+  const handleManualToken = async (manualToken: string, permanent = true) => {
     try {
       setIsSigningIn(true);
       setAuthError(null);
-      const googleUser = await setManualAccessToken(manualToken);
+      setIsSessionExpired(false);
+      const googleUser = await setManualAccessToken(manualToken, permanent);
       setUser(googleUser);
       setToken(manualToken.trim());
-      addLog(`Połączono za pomocą tokenu jako ${googleUser.displayName || googleUser.email}`, 'success');
+      initializedTokenRef.current = manualToken.trim();
+      await initializeWorkspaceData(manualToken.trim());
+      addLog(
+        permanent
+          ? `Połączono za pomocą stałego tokenu Google jako ${googleUser.displayName || googleUser.email} (bez wygasania)`
+          : `Połączono za pomocą tokenu jako ${googleUser.displayName || googleUser.email}`,
+        'success'
+      );
     } catch (err: any) {
       console.error('Błąd weryfikacji tokenu:', err);
       setAuthError(err.message || 'Nie udało się zweryfikować tokenu dostępu.');
@@ -1136,12 +1147,8 @@ export default function App() {
 
       isAutoRefreshingRef.current = true;
       try {
-        if (isStoredTokenExpired()) {
-          const freshToken = await refreshGoogleTokenSilently();
-          if (!freshToken) {
-            setIsSessionExpired(true);
-            return;
-          }
+        if (isStoredTokenExpired() && !isPermanentTokenActive()) {
+          setIsSessionExpired(true);
         }
 
         await Promise.allSettled([
@@ -2479,9 +2486,9 @@ export default function App() {
   // --- Template Sets Handlers ---
 
   const syncTemplatesToCloud = (sets: TaskTemplateSet[], activeId: string) => {
-    const syncUserId = auth.currentUser?.uid || user?.uid;
-    if (syncUserId) {
-      saveCloudTemplates(syncUserId, sets, activeId).catch((err) => {
+    const syncAccountKey = getGoogleAccountSyncKey(user) || getGoogleAccountSyncKey(getStoredAuth()?.user);
+    if (syncAccountKey) {
+      saveCloudTemplates(syncAccountKey, sets, activeId).catch((err) => {
         console.warn('Błąd synchronizacji szablonów w chmurze:', err);
       });
     }
@@ -2573,14 +2580,26 @@ export default function App() {
   const handleResetTemplates = () => {
     const defaults = resetTemplatesToDefault();
     setTemplates(defaults);
-    addLog('Przywrócono domyślne zadania w szablonie', 'info');
+    const updatedSets = templateSets.map((s) =>
+      s.id === activeTemplateSetId ? { ...s, templates: defaults } : s
+    );
+    saveTemplateSets(updatedSets);
+    setTemplateSets(updatedSets);
+    syncTemplatesToCloud(updatedSets, activeTemplateSetId);
+    addLog('Przywrócono domyślne zadania w szablonie i zsynchronizowano', 'info');
   };
 
   const handleResetToFactory = () => {
     const factory = resetTemplatesToFactory();
     setTemplates(factory);
     setHasCustomDefault(false);
-    addLog('Przywrócono fabryczny szablon (7 zadań)', 'info');
+    const updatedSets = templateSets.map((s) =>
+      s.id === activeTemplateSetId ? { ...s, templates: factory } : s
+    );
+    saveTemplateSets(updatedSets);
+    setTemplateSets(updatedSets);
+    syncTemplatesToCloud(updatedSets, activeTemplateSetId);
+    addLog('Przywrócono fabryczny szablon (7 zadań) i zsynchronizowano', 'info');
   };
 
   return (

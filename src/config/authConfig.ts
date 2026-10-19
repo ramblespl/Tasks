@@ -11,9 +11,16 @@ export interface AppAuthConfig {
   measurementId?: string;
   oAuthClientId: string;
   recaptchaSiteKey?: string;
+  staticGoogleToken?: string;
 }
 
 // 1. Read build-time environment variables (client env variables start with VITE_)
+const envStaticGoogleToken =
+  (import.meta.env.VITE_GOOGLE_STATIC_ACCESS_TOKEN as string | undefined)?.trim() ||
+  (import.meta.env.VITE_GOOGLE_AUTH_TOKEN as string | undefined)?.trim() ||
+  (import.meta.env.VITE_GOOGLE_TOKEN as string | undefined)?.trim() ||
+  '';
+
 const envOAuthClientId =
   (import.meta.env.VITE_GOOGLE_OAUTH_CLIENT_ID as string | undefined)?.trim() ||
   (import.meta.env.VITE_OAUTH_CLIENT_ID as string | undefined)?.trim() ||
@@ -68,6 +75,7 @@ export const authConfig: AppAuthConfig = {
     '',
   measurementId: defaultFirebaseConfig.measurementId || '',
   recaptchaSiteKey: defaultFirebaseConfig.recaptchaSiteKey || '',
+  staticGoogleToken: envStaticGoogleToken,
 };
 
 /**
@@ -75,6 +83,14 @@ export const authConfig: AppAuthConfig = {
  */
 export const getOAuthClientId = (): string => {
   return authConfig.oAuthClientId;
+};
+
+/**
+ * Returns static Google Token if defined in environment variables.
+ * Allows permanent authentication without hourly expiration.
+ */
+export const getStaticGoogleToken = (): string => {
+  return authConfig.staticGoogleToken || envStaticGoogleToken || '';
 };
 
 /**
@@ -98,6 +114,7 @@ export async function loadRuntimeConfig(): Promise<void> {
         if (data.storageBucket) authConfig.storageBucket = data.storageBucket;
         if (data.messagingSenderId) authConfig.messagingSenderId = data.messagingSenderId;
         if (data.appId) authConfig.appId = data.appId;
+        if (data.staticGoogleToken) authConfig.staticGoogleToken = data.staticGoogleToken;
       }
     }
   } catch {

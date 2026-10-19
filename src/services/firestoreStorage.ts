@@ -92,27 +92,55 @@ export interface CloudTemplatesData {
 }
 
 /**
+ * Generates a stable, cross-device Firestore document identifier for a Google user.
+ * Ensures that logging in with the same Google Account on multiple devices
+ * (phone, desktop, tablet) will always resolve to the exact same templates document.
+ */
+export function getGoogleAccountSyncKey(user: { uid?: string; email?: string } | null): string | null {
+  if (!user) return null;
+
+  // 1. Primary: user email is unique, universal and identical across all devices
+  if (user.email && user.email.trim()) {
+    const cleanEmail = user.email.trim().toLowerCase();
+    const sanitized = cleanEmail.replace(/[^a-zA-Z0-9]/g, '_');
+    return `account_${sanitized}`;
+  }
+
+  // 2. Secondary: if uid is a stable Google ID (numeric Google sub ID or prefixed)
+  if (user.uid && user.uid.trim()) {
+    const cleanUid = user.uid.trim();
+    if (cleanUid !== 'google-saved' && !cleanUid.startsWith('manual-')) {
+      const sanitized = cleanUid.replace(/[^a-zA-Z0-9_\-]/g, '_');
+      return `account_${sanitized}`;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Loads user template sets from Firestore.
- * Gracefully falls back to null if offline or unreachable within 2.5s.
+ * Gracefully falls back to null if offline or unreachable within 3.5s.
  */
 export async function loadCloudTemplates(
-  userId: string
+  syncKey: string
 ): Promise<{ templateSets: TaskTemplateSet[]; activeTemplateSetId: string } | null> {
-  if (!userId) return null;
+  if (!syncKey) return null;
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     return null;
   }
 
   try {
-    const docRef = doc(db, 'users', userId, 'settings', 'templates');
+    const docRef = doc(db, 'users', syncKey, 'settings', 'templates');
     const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Firestore timeout')), 2500)
+      setTimeout(() => reject(new Error('Firestore timeout')), 3500)
     );
     const snap = await Promise.race([getDoc(docRef), timeoutPromise]);
 
     if (snap.exists()) {
       const data = snap.data() as CloudTemplatesData;
       if (Array.isArray(data.templateSets) && data.templateSets.length > 0) {
+        console.log(`Firestore: Załadowano ${data.templateSets.length} zestawów szablonów z chmury dla konta [${syncKey}]`);
         return {
           templateSets: data.templateSets,
           activeTemplateSetId: data.activeTemplateSetId || data.templateSets[0].id,
@@ -131,28 +159,29 @@ export async function loadCloudTemplates(
  * Non-fatal if offline.
  */
 export async function saveCloudTemplates(
-  userId: string,
+  syncKey: string,
   templateSets: TaskTemplateSet[],
   activeTemplateSetId: string
 ): Promise<void> {
-  if (!userId) return;
+  if (!syncKey) return;
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
 
   try {
-    const docRef = doc(db, 'users', userId, 'settings', 'templates');
+    const docRef = doc(db, 'users', syncKey, 'settings', 'templates');
     const payload: CloudTemplatesData = {
-      userId,
+      userId: syncKey,
       templateSets,
       activeTemplateSetId: activeTemplateSetId || templateSets[0]?.id || 'set-universal',
       updatedAt: new Date().toISOString(),
     };
     const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Firestore save timeout')), 3000)
+      setTimeout(() => reject(new Error('Firestore save timeout')), 4000)
     );
     await Promise.race([
       setDoc(docRef, payload, { merge: true }),
       timeoutPromise,
     ]);
+    console.log(`Firestore: Pomyślnie zsynchronizowano szablony w chmurze dla konta [${syncKey}]`);
   } catch (err: any) {
     console.warn(`Firestore: Nie udało się zsynchronizować szablonów w chmurze (${err?.message || 'offline'}). Zapisano lokalnie.`);
   }
@@ -162,12 +191,11 @@ export async function saveCloudTemplates(
  * Subscribes to real-time updates for user templates across devices.
  */
 export function subscribeToCloudTemplates(
-  userId: string,
+  syncKey: string,
   onUpdate: (data: { templateSets: TaskTemplateSet[]; activeTemplateSetId: string }) => void,
   onError?: (err: Error) => void
 ): Unsubscribe {
-  const path = `users/${userId}/settings/templates`;
-  const docRef = doc(db, 'users', userId, 'settings', 'templates');
+  const docRef = doc(db, 'users', syncKey, 'settings', 'templates');
 
   return onSnapshot(
     docRef,
@@ -175,6 +203,7 @@ export function subscribeToCloudTemplates(
       if (snap.exists()) {
         const data = snap.data() as CloudTemplatesData;
         if (Array.isArray(data.templateSets) && data.templateSets.length > 0) {
+          console.log(`Firestore: Odebrano aktualizację szablonów w czasie rzeczywistym dla konta [${syncKey}]`);
           onUpdate({
             templateSets: data.templateSets,
             activeTemplateSetId: data.activeTemplateSetId || data.templateSets[0].id,
@@ -183,7 +212,7 @@ export function subscribeToCloudTemplates(
       }
     },
     (error) => {
-      console.warn('Subskrypcja Firestore (tryb offline lub oczekiwanie):', error.message);
+      console.warn('Subskrypcja Firestore:', error.message);
       if (onError) onError(error);
     }
   );

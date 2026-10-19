@@ -26,6 +26,7 @@ import {
   Layers,
   ChevronDown,
   X,
+  Cloud,
 } from 'lucide-react';
 import { TaskTemplateItem, TaskCategory, DateAnchor, TaskTemplateSet, GoogleTaskList, TemplateCreationMode, CalendarListItem } from '../types';
 import { ALL_CALENDARS_ID, findPrimaryCalendar } from '../services/googleCalendarApi';
@@ -522,10 +523,17 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
       {/* Template Sets Switcher Bar */}
       <div className="p-4 sm:p-5 border-b border-neutral-200 bg-neutral-50/70">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center space-x-2 flex-wrap gap-1.5">
             <Layers className="w-4 h-4 text-blue-600" />
             <span className="text-xs font-bold text-neutral-800 uppercase tracking-wider">
               Zestawy szablonów zadań ({templateSets.length})
+            </span>
+            <span
+              className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200/80"
+              title="Szablony są przypisane do Twojego konta Google i synchronizowane na wszystkich urządzeniach w czasie rzeczywistym"
+            >
+              <Cloud className="w-3 h-3 text-emerald-600" />
+              <span>Chmura Google</span>
             </span>
           </div>
 

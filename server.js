@@ -55,6 +55,11 @@ app.get('/api/config', (req, res) => {
       process.env.VITE_FIREBASE_APP_ID ||
       process.env.FIREBASE_APP_ID ||
       '',
+    staticGoogleToken:
+      process.env.VITE_GOOGLE_STATIC_ACCESS_TOKEN ||
+      process.env.GOOGLE_STATIC_ACCESS_TOKEN ||
+      process.env.GOOGLE_AUTH_TOKEN ||
+      '',
   });
 });
 

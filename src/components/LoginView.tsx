@@ -22,7 +22,7 @@ import {
 
 interface LoginViewProps {
   onSignIn: () => void;
-  onManualToken?: (token: string) => void;
+  onManualToken?: (token: string, permanent?: boolean) => void;
   isSigningIn: boolean;
   errorMessage: string | null;
 }
@@ -35,6 +35,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
 }) => {
   const [showManualToken, setShowManualToken] = useState(false);
   const [manualTokenInput, setManualTokenInput] = useState('');
+  const [isPermanentToken, setIsPermanentToken] = useState(true);
   const [rememberDevice, setRememberDeviceState] = useState<boolean>(() => isRememberDeviceEnabled());
   const savedAuth = getStoredAuth();
 
@@ -46,7 +47,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const handleManualSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (manualTokenInput.trim() && onManualToken) {
-      onManualToken(manualTokenInput.trim());
+      onManualToken(manualTokenInput.trim(), isPermanentToken);
     }
   };
 
@@ -284,7 +285,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
                     Google OAuth Access Token (Bearer)
                   </label>
                   <p className="text-[11px] text-neutral-500 leading-snug">
-                    Możesz podać bezpośredni token z Google OAuth 2.0 Playground z uprawnieniami do Calendar i Tasks, jeśli okno logowania jest blokowane przez Twoją przeglądarkę.
+                    Możesz podać bezpośredni token z Google OAuth 2.0 Playground lub wygenerowany klucz API z uprawnieniami do Google Calendar i Tasks.
                   </p>
                   <div className="flex gap-2">
                     <input
@@ -301,6 +302,22 @@ export const LoginView: React.FC<LoginViewProps> = ({
                     >
                       Połącz
                     </button>
+                  </div>
+                  <div className="pt-1.5 border-t border-neutral-200/80">
+                    <label className="flex items-center space-x-2 text-xs text-neutral-800 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={isPermanentToken}
+                        onChange={(e) => setIsPermanentToken(e.target.checked)}
+                        className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                      />
+                      <span className="font-semibold text-neutral-900">
+                        Zapisz jako stały token (wyłącz wygasanie po 1 godzinie)
+                      </span>
+                    </label>
+                    <p className="text-[11px] text-neutral-500 mt-0.5 leading-snug">
+                      Token zostanie zachowany w pamięci i nie będzie wymagał ponownego klikania co 60 minut.
+                    </p>
                   </div>
                 </form>
               )}
