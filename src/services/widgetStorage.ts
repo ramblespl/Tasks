@@ -1,6 +1,7 @@
 export type WidgetId =
   | 'pulpit'
   | 'cal_month'
+  | 'cal_2weeks'
   | 'cal_week'
   | 'cal_day'
   | 'cal_schedule'
@@ -19,7 +20,7 @@ export interface WidgetConfig {
   shortName: string;
   description: string;
   targetTab: 'dashboard' | 'calendar' | 'tasks';
-  calendarViewMode?: 'miesiac' | 'tydzien' | 'dzien' | 'harmonogram';
+  calendarViewMode?: 'miesiac' | '2tygodnie' | 'tydzien' | 'dzien' | 'harmonogram';
 
   // 1. Widoczność Kalendarzy:
   allCalendars: boolean;
@@ -55,6 +56,20 @@ export const DEFAULT_WIDGET_CONFIGS: Record<WidgetId, WidgetConfig> = {
     description: 'Widget kalendarza w widoku pełnego miesiąca z terminami',
     targetTab: 'calendar',
     calendarViewMode: 'miesiac',
+    allCalendars: true,
+    selectedCalendarIds: [],
+    allTaskLists: true,
+    selectedTaskListIds: [],
+    dateRangeFilter: 'all',
+    includeNoDate: true,
+  },
+  cal_2weeks: {
+    id: 'cal_2weeks',
+    name: 'Kalendarz - 2 tygodnie',
+    shortName: '2 tygodnie',
+    description: 'Widget kalendarza w widoku 2-tygodniowym z siatką godzinową i zadaniami',
+    targetTab: 'calendar',
+    calendarViewMode: '2tygodnie',
     allCalendars: true,
     selectedCalendarIds: [],
     allTaskLists: true,

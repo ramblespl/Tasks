@@ -49,6 +49,7 @@ export interface GoogleTaskItem {
   title: string;
   notes?: string;
   due?: string;
+  time?: string;
   status: 'needsAction' | 'completed';
   completed?: string;
   updated?: string;

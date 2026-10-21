@@ -11,29 +11,68 @@ export const formatTaskTitleWithTime = (title: string, time?: string): string =>
   return `${time} - ${clean}`;
 };
 
+const TASK_ASSIGNED_TIMES_KEY = 'google_tasks_assigned_times';
+
+export const getTaskAssignedTimesMap = (): Record<string, string> => {
+  try {
+    const raw = localStorage.getItem(TASK_ASSIGNED_TIMES_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+};
+
+export const getTaskAssignedTime = (taskId?: string): string | null => {
+  if (!taskId) return null;
+  const map = getTaskAssignedTimesMap();
+  return map[taskId] || null;
+};
+
+export const saveTaskAssignedTime = (taskId: string, time: string | null): void => {
+  if (!taskId) return;
+  try {
+    const map = getTaskAssignedTimesMap();
+    if (time) {
+      map[taskId] = time;
+    } else {
+      delete map[taskId];
+    }
+    localStorage.setItem(TASK_ASSIGNED_TIMES_KEY, JSON.stringify(map));
+  } catch (err) {
+    console.warn('Błąd zapisu przypisanej godziny zadania:', err);
+  }
+};
+
 export const extractTaskTitleAndTime = (
   title: string,
   taskNotes?: string,
   templates?: TaskTemplateItem[],
-  taskDue?: string
+  taskDue?: string,
+  taskId?: string,
+  explicitTime?: string
 ): { time: string | null; cleanTitle: string } => {
-  const match = title.match(/^(?:\[(\d{1,2}:\d{2})\]|(\d{1,2}:\d{2})(?:[-–:]|\s))\s*(.+)$/);
-  if (match) {
+  const clean = cleanTaskTitle(title);
+
+  // 0. Direct explicit time property on task (e.g. task.time)
+  if (explicitTime && /^(\d{1,2}:\d{2})$/.test(explicitTime)) {
     return {
-      time: match[1] || match[2],
-      cleanTitle: match[3].trim(),
+      time: explicitTime,
+      cleanTitle: clean,
     };
   }
-  if (taskNotes) {
-    const noteMatch = taskNotes.match(/(?:⏰\s*)?Godzina(?:\s*wykonania|\s*rozpoczęcia)?:\s*(\d{1,2}:\d{2})/i);
-    if (noteMatch) {
+
+  // 1. Direct explicit assigned time for this task (highest priority)
+  if (taskId) {
+    const directTime = getTaskAssignedTime(taskId);
+    if (directTime) {
       return {
-        time: noteMatch[1],
-        cleanTitle: cleanTaskTitle(title),
+        time: directTime,
+        cleanTitle: clean,
       };
     }
   }
-  // Check if taskDue has a non-midnight time (explicit hour in Google Tasks / To Do)
+
+  // 2. Check if taskDue has a non-midnight time (explicit hour in RFC 3339)
   if (taskDue && taskDue.includes('T')) {
     const isDateOnlyMidnight = /T00:00:00(\.000)?Z$/i.test(taskDue);
     if (!isDateOnlyMidnight) {
@@ -43,12 +82,13 @@ export const extractTaskTitleAndTime = (
         const dueTime = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
         return {
           time: dueTime,
-          cleanTitle: cleanTaskTitle(title),
+          cleanTitle: clean,
         };
       }
     }
   }
-  const clean = cleanTaskTitle(title);
+
+  // 3. Match from active templates
   if (templates && templates.length > 0) {
     const matched = templates.find(
       (t) => cleanTaskTitle(t.title).toLowerCase() === clean.toLowerCase()
@@ -60,6 +100,27 @@ export const extractTaskTitleAndTime = (
       };
     }
   }
+
+  // 4. Legacy format in title if present (e.g. "[18:00] Tytuł")
+  const match = title.match(/^(?:\[(\d{1,2}:\d{2})\]|(\d{1,2}:\d{2})(?:[-–:]|\s))\s*(.+)$/);
+  if (match) {
+    return {
+      time: match[1] || match[2],
+      cleanTitle: match[3].trim(),
+    };
+  }
+
+  // 5. Legacy format in notes if present
+  if (taskNotes) {
+    const noteMatch = taskNotes.match(/(?:⏰\s*)?Godzina(?:\s*wykonania|\s*rozpoczęcia)?:\s*(\d{1,2}:\d{2})/i);
+    if (noteMatch) {
+      return {
+        time: noteMatch[1],
+        cleanTitle: clean,
+      };
+    }
+  }
+
   return {
     time: null,
     cleanTitle: clean,

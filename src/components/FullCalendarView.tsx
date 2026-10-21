@@ -66,7 +66,7 @@ import { computeDayTimedEventLayouts } from '../utils/calendarLayout';
 
 const HOURS_24 = Array.from({ length: 24 }, (_, i) => i);
 
-export type CalendarViewMode = 'harmonogram' | 'dzien' | 'tydzien' | '4tygodnie' | 'miesiac';
+export type CalendarViewMode = 'harmonogram' | 'dzien' | 'tydzien' | '2tygodnie' | '4tygodnie' | 'miesiac';
 
 interface FullCalendarViewProps {
   initialViewMode?: CalendarViewMode;
@@ -251,17 +251,17 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
   }, [taskLists]);
   // Current view mode (default: month view or initialViewMode)
   const [viewMode, setViewMode] = useState<CalendarViewMode>(() => {
-    if (initialViewMode && ['harmonogram', 'dzien', 'tydzien', '4tygodnie', 'miesiac'].includes(initialViewMode)) {
+    if (initialViewMode && ['harmonogram', 'dzien', 'tydzien', '2tygodnie', '4tygodnie', 'miesiac'].includes(initialViewMode)) {
       return initialViewMode;
     }
     const saved = localStorage.getItem('travel_calendar_view_mode') as CalendarViewMode;
-    return saved && ['harmonogram', 'dzien', 'tydzien', '4tygodnie', 'miesiac'].includes(saved)
+    return saved && ['harmonogram', 'dzien', 'tydzien', '2tygodnie', '4tygodnie', 'miesiac'].includes(saved)
       ? saved
       : 'miesiac';
   });
 
   useEffect(() => {
-    if (initialViewMode && ['harmonogram', 'dzien', 'tydzien', '4tygodnie', 'miesiac'].includes(initialViewMode)) {
+    if (initialViewMode && ['harmonogram', 'dzien', 'tydzien', '2tygodnie', '4tygodnie', 'miesiac'].includes(initialViewMode)) {
       setViewMode(initialViewMode);
     }
   }, [initialViewMode]);
@@ -269,6 +269,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
   const handleSelectViewMode = (mode: CalendarViewMode) => {
     setViewMode(mode);
     localStorage.setItem('travel_calendar_view_mode', mode);
+    if (mode === '2tygodnie') {
+      setTwoWeeksStartDate(getStartOfWeek(cursorDate));
+    }
     // W karcie kalendarz:
     // dla widoku harmonogram wyświetlaj domyślnie zakres dat Od dzisiaj
     // dla pozostałych widoków wyświetlaj zakres dat wszystkie
@@ -279,6 +282,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
   // Cursor date for navigation
   const [cursorDate, setCursorDate] = useState<Date>(() => new Date());
+
+  // Anchor date for 2-weeks view: always start of week 1 of the 2-week span so clicking a day in week 2 never shifts the view
+  const [twoWeeksStartDate, setTwoWeeksStartDate] = useState<Date>(() => getStartOfWeek(new Date()));
 
   // Selected day in Month and 4-Weeks view (single-click day selection)
   const [selectedMonthDateStr, setSelectedMonthDateStr] = useState<string>(() => toDateString(new Date()));
@@ -512,7 +518,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
   // Navigation handlers
   const handleGoToday = () => {
-    setCursorDate(new Date());
+    const today = new Date();
+    setCursorDate(today);
+    setTwoWeeksStartDate(getStartOfWeek(today));
+    setSelectedMonthDateStr(toDateString(today));
   };
 
   const cursorDateRef = useRef(cursorDate);
@@ -528,6 +537,13 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
         next.setDate(next.getDate() + direction * 1);
       } else if (mode === 'tydzien') {
         next.setDate(next.getDate() + direction * 7);
+      } else if (mode === '2tygodnie') {
+        setTwoWeeksStartDate((prevAnchor) => {
+          const nextAnchor = new Date(prevAnchor);
+          nextAnchor.setDate(nextAnchor.getDate() + direction * 14);
+          return nextAnchor;
+        });
+        next.setDate(next.getDate() + direction * 14);
       } else if (mode === '4tygodnie') {
         next.setDate(next.getDate() + direction * 28);
       } else {
@@ -611,11 +627,21 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
   const [timelineViewportHeight, setTimelineViewportHeight] = useState<number>(0);
   const weekScrollRef = useRef<HTMLDivElement>(null);
+  const twoWeeksScrollRef1 = useRef<HTMLDivElement>(null);
+  const twoWeeksScrollRef2 = useRef<HTMLDivElement>(null);
+  const twoWeeksScrollRef = twoWeeksScrollRef1;
   const dayScrollRef = useRef<HTMLDivElement>(null);
 
-  // ResizeObserver for Day and Week timeline containers to calculate exact hour height for 6:00 to 22:00
+  // ResizeObserver for Day, Week, and 2-Weeks timeline containers to calculate exact hour height for 6:00 to 20:00
   useEffect(() => {
-    const el = viewMode === 'tydzien' ? weekScrollRef.current : viewMode === 'dzien' ? dayScrollRef.current : null;
+    const el =
+      viewMode === 'tydzien'
+        ? weekScrollRef.current
+        : viewMode === '2tygodnie'
+        ? twoWeeksScrollRef1.current
+        : viewMode === 'dzien'
+        ? dayScrollRef.current
+        : null;
     if (!el) return;
     const updateSize = () => {
       if (el.clientHeight > 0) {
@@ -634,21 +660,27 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     return () => ro.disconnect();
   }, [viewMode]);
 
-  // Height of 1 hour in Day and Week views:
-  // Reduced by 20% to fit more hours in the visible height (fits ~20 hours)
+  // Height of 1 hour in Day, Week, and 2-Weeks views:
+  // User requirement: default view should show hours from 6 to 20 (14 hours)
+  // timelineViewportHeight / 14 allows hours 6:00 to 20:00 to fit smoothly in the view,
+  // with full ability to scroll up to 0:00-6:00 and down to 20:00-24:00.
   const hourHeight = useMemo(() => {
     if (timelineViewportHeight > 0) {
-      return Math.max(26, Math.floor((timelineViewportHeight / 16) * 0.8));
+      return Math.max(28, Math.floor(timelineViewportHeight / 14));
     }
-    return 38;
+    return 36;
   }, [timelineViewportHeight]);
 
-  // Default scroll to 6:00 (so 6:00 to 22:00 is displayed)
+  // User requirement: obydwa kalendarze można przesuwać w pionie niezależnie (independent scrolling for Week 1 and Week 2)
+
+  // Default scroll to 6:00 (so 6:00 to 20:00 is displayed by default, scrollable to 0-6 and 20-24)
   useEffect(() => {
-    if (viewMode === 'tydzien' || viewMode === 'dzien') {
+    if (viewMode === 'tydzien' || viewMode === '2tygodnie' || viewMode === 'dzien') {
       const targetScroll = 6 * hourHeight;
       const applyScroll = () => {
         if (weekScrollRef.current) weekScrollRef.current.scrollTop = targetScroll;
+        if (twoWeeksScrollRef1.current) twoWeeksScrollRef1.current.scrollTop = targetScroll;
+        if (twoWeeksScrollRef2.current) twoWeeksScrollRef2.current.scrollTop = targetScroll;
         if (dayScrollRef.current) dayScrollRef.current.scrollTop = targetScroll;
       };
       applyScroll();
@@ -870,7 +902,24 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     setShowEventModal(true);
   };
 
-  // Keyboard shortcut listeners (d, w, x, m, n)
+  // Helper to re-center timeline scroll to 6:00 - 20:00 default hours
+  const handleScrollToDefaultHours = useCallback(() => {
+    const targetScroll = 6 * hourHeight;
+    if (twoWeeksScrollRef1.current) {
+      twoWeeksScrollRef1.current.scrollTo({ top: targetScroll, behavior: 'smooth' });
+    }
+    if (twoWeeksScrollRef2.current) {
+      twoWeeksScrollRef2.current.scrollTo({ top: targetScroll, behavior: 'smooth' });
+    }
+    if (weekScrollRef.current) {
+      weekScrollRef.current.scrollTo({ top: targetScroll, behavior: 'smooth' });
+    }
+    if (dayScrollRef.current) {
+      dayScrollRef.current.scrollTo({ top: targetScroll, behavior: 'smooth' });
+    }
+  }, [hourHeight]);
+
+  // Keyboard shortcut listeners (2, w/t, 4, m, d, h)
   useEffect(() => {
     const handleSwitchCalendarView = (e: Event) => {
       const customEvent = e as CustomEvent<{ mode: CalendarViewMode }>;
@@ -882,13 +931,45 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
       handleOpenAddEvent(selectedMonthDateStr || toDateString(cursorDate));
     };
 
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const activeEl = document.activeElement;
+      if (
+        activeEl &&
+        (activeEl.tagName === 'INPUT' ||
+          activeEl.tagName === 'TEXTAREA' ||
+          activeEl.tagName === 'SELECT' ||
+          activeEl.getAttribute('contenteditable') === 'true')
+      ) {
+        return;
+      }
+      if (showEventModal || editingTask || previewEvent || eventToDelete) {
+        return;
+      }
+
+      if (e.key === '2') {
+        handleSelectViewMode('2tygodnie');
+      } else if (e.key === 'w' || e.key === 'W' || e.key === 't' || e.key === 'T') {
+        handleSelectViewMode('tydzien');
+      } else if (e.key === '4') {
+        handleSelectViewMode('4tygodnie');
+      } else if (e.key === 'm' || e.key === 'M') {
+        handleSelectViewMode('miesiac');
+      } else if (e.key === 'd' || e.key === 'D') {
+        handleSelectViewMode('dzien');
+      } else if (e.key === 'h' || e.key === 'H') {
+        handleSelectViewMode('harmonogram');
+      }
+    };
+
     window.addEventListener('app:switch-calendar-view', handleSwitchCalendarView);
     window.addEventListener('app:open-new-event', handleTriggerNewEvent);
+    window.addEventListener('keydown', handleKeyDown);
     return () => {
       window.removeEventListener('app:switch-calendar-view', handleSwitchCalendarView);
       window.removeEventListener('app:open-new-event', handleTriggerNewEvent);
+      window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [handleOpenAddEvent, handleSelectViewMode, selectedMonthDateStr, cursorDate]);
+  }, [handleOpenAddEvent, handleSelectViewMode, selectedMonthDateStr, cursorDate, showEventModal, editingTask, previewEvent, eventToDelete]);
 
   // Open modal to edit event
   const handleOpenEditEvent = (event: CalendarEventItem) => {
@@ -1156,22 +1237,19 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
       const currentDueStr = extractLocalDateStr(t.due);
       if (!currentDueStr) return;
 
-      let start: { dateTime?: string; date?: string } = {};
-      let end: { dateTime?: string; date?: string } = {};
+      // User requirement: w widoku każdego tygodnia ma być domyślnie widać zadania z podziałem na godziny
+      // If task has an explicit hour, use it; otherwise default to 09:00 so task is displayed with hourly breakdown
+      const effectiveTime = time || '09:00';
+      const [h, m] = effectiveTime.split(':').map(Number);
+      const safeH = isNaN(h) ? 9 : h;
+      const safeM = isNaN(m) ? 0 : m;
+      const endH = (safeH + Math.floor((safeM + 30) / 60)) % 24;
+      const endM = (safeM + 30) % 60;
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const endTimeStr = `${pad(endH)}:${pad(endM)}`;
 
-      if (time && currentDueStr) {
-        const [h, m] = time.split(':').map(Number);
-        const endH = (h + Math.floor((m + 30) / 60)) % 24;
-        const endM = (m + 30) % 60;
-        const pad = (n: number) => String(n).padStart(2, '0');
-        const endTimeStr = `${pad(endH)}:${pad(endM)}`;
-
-        start = { dateTime: `${currentDueStr}T${time}:00` };
-        end = { dateTime: `${currentDueStr}T${endTimeStr}:00` };
-      } else {
-        start = { date: currentDueStr };
-        end = { date: currentDueStr };
-      }
+      const start = { dateTime: `${currentDueStr}T${effectiveTime}:00` };
+      const end = { dateTime: `${currentDueStr}T${endTimeStr}:00` };
 
       // Check if task matches a template that has an assigned Google Calendar color (etykieta koloru)
       const matchedColorId = templateColorMap.get(cleanTitle.toLowerCase());
@@ -1250,6 +1328,16 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
       const start = getStartOfWeek(cursorDate);
       const end = new Date(start);
       end.setDate(end.getDate() + 6);
+      if (start.getMonth() === end.getMonth()) {
+        return `${start.getDate()} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} ${start.getFullYear()}`;
+      }
+      return `${start.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[end.getMonth()]} ${end.getFullYear()}`;
+    }
+
+    if (viewMode === '2tygodnie') {
+      const start = twoWeeksStartDate;
+      const end = new Date(start);
+      end.setDate(end.getDate() + 13);
       if (start.getMonth() === end.getMonth()) {
         return `${start.getDate()} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} ${start.getFullYear()}`;
       }
@@ -1342,6 +1430,26 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     }
     return days;
   }, [cursorDate]);
+
+  // Render 2 Weeks View Data (14 days starting from Monday anchored by twoWeeksStartDate)
+  const twoWeeksDays = useMemo(() => {
+    const start = twoWeeksStartDate;
+    const days: { date: Date; dateStr: string; dayIndex: number; weekIndex: number }[] = [];
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(start);
+      d.setDate(d.getDate() + i);
+      days.push({
+        date: d,
+        dateStr: toDateString(d),
+        dayIndex: i % 7,
+        weekIndex: Math.floor(i / 7),
+      });
+    }
+    return days;
+  }, [twoWeeksStartDate]);
+
+  // Two weeks sub-view filter ('all' = all 14 days, 'w1' = 1st week, 'w2' = 2nd week)
+  const [twoWeeksFilter, setTwoWeeksFilter] = useState<'all' | 'w1' | 'w2'>('all');
 
   // Map events to date string for fast lookup spanning multiple days if needed
   const eventsByDate = useMemo(() => {
@@ -1444,6 +1552,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
             [
               { id: 'dzien', label: 'Dzień' },
               { id: 'tydzien', label: 'Tydzień' },
+              { id: '2tygodnie', label: '2 tyg.' },
               { id: '4tygodnie', label: '4 tyg.' },
               { id: 'miesiac', label: 'Miesiąc' },
               { id: 'harmonogram', label: 'Harmonogram' },
@@ -1899,6 +2008,22 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
             <button
               type="button"
+              id="view-mode-2tygodnie"
+              onClick={() => handleSelectViewMode('2tygodnie')}
+              className={`w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
+                viewMode === '2tygodnie'
+                  ? 'bg-blue-600 text-white font-semibold shadow-xs'
+                  : 'text-neutral-700 hover:bg-neutral-100'
+              }`}
+            >
+              <span className="flex items-center space-x-2">
+                <CalendarRange className="w-3.5 h-3.5" />
+                <span>2 tygodnie</span>
+              </span>
+            </button>
+
+            <button
+              type="button"
               id="view-mode-tydzien"
               onClick={() => handleSelectViewMode('tydzien')}
               className={`w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
@@ -2245,6 +2370,19 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               </button>
               <button
                 type="button"
+                onClick={() => handleSelectViewMode('2tygodnie')}
+                className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === '2tygodnie'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku 2 tygodni (2)"
+                aria-label="Widok 2 tygodni"
+              >
+                2
+              </button>
+              <button
+                type="button"
                 onClick={() => handleSelectViewMode('tydzien')}
                 className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold transition-all cursor-pointer border shadow-2xs ${
                   viewMode === 'tydzien'
@@ -2350,6 +2488,20 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                 aria-label="Widok 4 tygodni (4)"
               >
                 4
+              </button>
+              <button
+                type="button"
+                id="btn-shortcut-2weeks"
+                onClick={() => handleSelectViewMode('2tygodnie')}
+                className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all cursor-pointer border shadow-2xs ${
+                  viewMode === '2tygodnie'
+                    ? 'bg-blue-600 text-white border-blue-600 ring-2 ring-blue-500/20'
+                    : 'bg-white hover:bg-neutral-100 text-neutral-700 border-neutral-250 hover:text-neutral-900'
+                }`}
+                title="Przełącz do widoku 2 tygodni (2)"
+                aria-label="Widok 2 tygodni (2)"
+              >
+                2
               </button>
               <button
                 type="button"
@@ -3169,6 +3321,435 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
             </div>
           </div>
         )}
+
+        {/* VIEW 3b: 2 Tygodnie (2 Weeks view vertically stacked: Week 1 on top, Week 2 below, default hours 6:00 to 20:00) */}
+        {viewMode === '2tygodnie' && (() => {
+          const w1Days = twoWeeksDays.slice(0, 7);
+          const w2Days = twoWeeksDays.slice(7, 14);
+
+          const renderWeekColumns = (
+            daysToRender: typeof twoWeeksDays,
+            scrollRef?: React.RefObject<HTMLDivElement | null>,
+            showHourLabels: boolean = true,
+            containerClass: string = "overflow-y-auto flex-1 min-h-0 relative flex select-none divide-x divide-neutral-200 w-full max-w-full calendar-scrollbar"
+          ) => {
+            const colsCount = daysToRender.length;
+            const gridStyle = { gridTemplateColumns: `repeat(${colsCount}, minmax(0, 1fr))` };
+
+            return (
+              <div className="w-full min-w-0 max-w-full flex-1 flex flex-col overflow-hidden">
+                {/* 1. Header with Week Days (7 columns fitting screen width) */}
+                <div className="flex border-b border-neutral-200 bg-neutral-50/90 sticky top-0 z-30 shrink-0 h-8 sm:h-9 w-full">
+                  {/* Corner Time Column Header */}
+                  {showHourLabels && (
+                    <div className="w-8 sm:w-12 md:w-16 shrink-0 px-0.5 sm:px-1 py-1 flex items-center justify-center border-r border-neutral-200 text-neutral-400">
+                      <Clock className="w-3 h-3 text-neutral-400 mr-1 hidden sm:inline" />
+                      <span className="text-[7px] sm:text-[9px] md:text-[10px] font-semibold tracking-wider uppercase">Godz.</span>
+                    </div>
+                  )}
+
+                  {/* Day Column Headers */}
+                  <div className="flex-1 grid divide-x divide-neutral-200 w-full min-w-0" style={gridStyle}>
+                    {daysToRender.map(({ date, dateStr, dayIndex }) => {
+                      const isToday = dateStr === todayStr;
+                      const isSelected = selectedMonthDateStr === dateStr || isSameDay(date, cursorDate);
+
+                      return (
+                        <div
+                          key={dateStr}
+                          onClick={() => {
+                            setSelectedMonthDateStr(dateStr);
+                            setCursorDate(new Date(dateStr + 'T12:00:00'));
+                          }}
+                          className={`px-0.5 py-0.5 sm:px-1.5 sm:py-1 text-center flex items-center justify-between group transition-colors min-w-0 overflow-hidden h-full cursor-pointer select-none ${
+                            isToday
+                              ? 'bg-blue-100/70 font-bold'
+                              : isSelected
+                              ? 'bg-blue-50/80 ring-1 ring-inset ring-blue-400/60'
+                              : 'bg-transparent hover:bg-neutral-100/60'
+                          }`}
+                          title={`Dzień: ${dateStr} (kliknij, aby wybrać)`}
+                        >
+                          <div className="flex items-center space-x-1 min-w-0 justify-start">
+                            <span
+                              className={`text-[8px] sm:text-[10px] md:text-[11px] font-semibold uppercase tracking-wider shrink-0 ${
+                                isToday ? 'text-blue-700 font-bold' : isSelected ? 'text-blue-800 font-semibold' : 'text-neutral-500'
+                              }`}
+                            >
+                              {DAY_NAMES_SHORT_PL[dayIndex]}
+                            </span>
+                            <span
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedMonthDateStr(dateStr);
+                                setCursorDate(new Date(dateStr + 'T12:00:00'));
+                              }}
+                              className={`w-4 h-4 sm:w-5 sm:h-5 md:w-6 md:h-6 rounded-full flex items-center justify-center text-[8px] sm:text-[10px] md:text-xs font-semibold shrink-0 cursor-pointer transition-all ${
+                                isToday
+                                  ? 'bg-blue-600 text-white font-bold shadow-xs'
+                                  : isSelected
+                                  ? 'bg-blue-200/90 text-blue-900 font-bold'
+                                  : 'text-neutral-800 hover:bg-neutral-200/70'
+                              }`}
+                              title={`Wybrany dzień: ${dateStr}`}
+                            >
+                              {date.getDate()}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleOpenAddEvent(dateStr);
+                            }}
+                            className="text-[9px] sm:text-xs text-neutral-400 hover:text-blue-600 font-bold cursor-pointer w-3.5 h-3.5 sm:w-4 sm:h-4 hidden sm:flex items-center justify-center rounded hover:bg-blue-100 transition shrink-0"
+                            title="Dodaj wydarzenie na ten dzień"
+                          >
+                            +
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 2. All-Day Events Row */}
+                <div className="flex border-b border-neutral-200 bg-neutral-50/40 text-xs shrink-0 w-full">
+                  {showHourLabels && (
+                    <div className="w-8 sm:w-12 md:w-16 shrink-0 p-0.5 sm:p-1 border-r border-neutral-200 flex items-center justify-end text-[7px] sm:text-[9px] font-semibold text-neutral-500 pr-0.5 sm:pr-1.5 leading-tight">
+                      <span className="hidden sm:inline">Cały dzień</span>
+                      <span className="sm:hidden">24h</span>
+                    </div>
+                  )}
+                  <div className="flex-1 grid divide-x divide-neutral-200 p-0.5 sm:p-1 w-full min-w-0" style={gridStyle}>
+                    {daysToRender.map(({ dateStr }) => {
+                      const dayEvents = eventsByDate[dateStr] || [];
+                      const allDayEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev));
+
+                      return (
+                        <div
+                          key={`allday-${dateStr}`}
+                          onDoubleClick={() => handleOpenAddEvent(dateStr)}
+                          className="px-0.5 sm:px-1 py-0.5 min-h-[22px] sm:min-h-[28px] space-y-0.5 min-w-0 max-h-14 overflow-y-auto day-cell-scrollbar"
+                          title="Podwójne kliknięcie: dodaj wydarzenie całodniowe"
+                        >
+                          {allDayEvents.map((ev) => {
+                            const isTask = isCalendarTaskEvent(ev);
+                            const isCompleted = isTask && isTaskCompleted(ev);
+                            const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
+                            const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+
+                            return (
+                              <div
+                                key={ev.id}
+                                onClick={() => setPreviewEvent(ev)}
+                                style={{
+                                  backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
+                                  color: isCompleted ? '#6b7280' : colorDef.contrastText,
+                                  borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.1)',
+                                  opacity: isCompleted ? 0.55 : 1,
+                                }}
+                                className={`text-[7px] sm:text-[9px] px-0.5 sm:px-1 py-0.5 rounded font-medium truncate cursor-pointer transition shadow-2xs select-none border ${
+                                  isCompleted ? 'hover:opacity-85 line-through' : 'hover:brightness-95'
+                                }`}
+                                title={`${ev.summary} (Cały dzień)`}
+                              >
+                                <span className="mr-0.5">{isTask ? (isCompleted ? '✓' : '○') : '●'}</span>
+                                {cleanTaskTitle(ev.summary)}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 3. 24-Hour Scrollable Grid (default displays 6:00 to 20:00, scrollable to other hours) */}
+                <div
+                  ref={scrollRef as any}
+                  className={containerClass}
+                >
+                  {/* Left Column: 24 Hour Labels (00:00 to 24:00) */}
+                  {showHourLabels && (
+                    <div className="w-8 sm:w-12 md:w-16 shrink-0 bg-neutral-50/70 border-r border-neutral-200 text-right pr-0.5 sm:pr-1.5">
+                      {HOURS_24.map((hour) => (
+                        <div
+                          key={hour}
+                          style={{ height: `${hourHeight}px` }}
+                          className="border-b border-neutral-100 flex items-start justify-end pt-0.5"
+                        >
+                          <span className="text-[7px] sm:text-[9px] font-medium text-neutral-400 select-none">
+                            <span className="sm:hidden">{String(hour).padStart(2, '0')}</span>
+                            <span className="hidden sm:inline">{String(hour).padStart(2, '0')}:00</span>
+                          </span>
+                        </div>
+                      ))}
+                      <div className="h-[24px] flex items-start justify-end pt-0.5">
+                        <span className="text-[7px] sm:text-[9px] font-semibold text-neutral-500 select-none">
+                          <span className="sm:hidden">24</span>
+                          <span className="hidden sm:inline">24:00</span>
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Day Columns with 24 Hourly Slots */}
+                  <div className="flex-1 grid divide-x divide-neutral-200 w-full min-w-0" style={gridStyle}>
+                    {daysToRender.map(({ dateStr }) => {
+                      const isToday = dateStr === todayStr;
+                      const dayEvents = eventsByDate[dateStr] || [];
+                      const timedEvents = dayEvents.filter(
+                        (ev) => !isEventLongerThan24hOrAllDay(ev) && !!ev.start.dateTime
+                      );
+
+                      const now = new Date();
+                      const currentHour = now.getHours();
+                      const currentMin = now.getMinutes();
+                      const currentTop = (currentHour * 60 + currentMin) * (hourHeight / 60);
+
+                      return (
+                        <div
+                          key={dateStr}
+                          style={{ height: `${24 * hourHeight}px` }}
+                          className={`relative min-w-0 ${
+                            isToday ? 'bg-blue-50/15' : 'bg-white'
+                          }`}
+                        >
+                          {/* Live time indicator line on today */}
+                          {isToday && (
+                            <div
+                              className="absolute left-0 right-0 border-t-2 border-red-500 z-20 pointer-events-none flex items-center"
+                              style={{ top: `${currentTop}px` }}
+                            >
+                              <div className="w-2 h-2 rounded-full bg-red-500 -ml-1 shadow-xs" />
+                            </div>
+                          )}
+
+                          {/* 24 Hour Slots */}
+                          {HOURS_24.map((hour) => {
+                            const timeStr = `${String(hour).padStart(2, '0')}:00`;
+                            return (
+                              <div
+                                key={hour}
+                                style={{ height: `${hourHeight}px` }}
+                                onClick={() => {
+                                  setSelectedMonthDateStr(dateStr);
+                                  setCursorDate(new Date(dateStr + 'T12:00:00'));
+                                }}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  handleOpenAddEvent(dateStr, timeStr);
+                                }}
+                                className="border-b border-neutral-100 hover:bg-blue-50/40 cursor-pointer transition-colors group relative"
+                                title={`Podwójne kliknięcie: dodaj o ${timeStr}`}
+                              >
+                                <span className="absolute left-0.5 top-0.5 text-[7px] sm:text-[8px] font-medium text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none truncate max-w-full">
+                                  +{timeStr}
+                                </span>
+                              </div>
+                            );
+                          })}
+
+                          {/* Timed events and tasks with hourly breakdown */}
+                          {(() => {
+                            const dayLayouts = computeDayTimedEventLayouts(timedEvents, hourHeight, 24 * hourHeight);
+                            return dayLayouts.map((item) => {
+                              const ev = item.event;
+                              const isTask = isCalendarTaskEvent(ev);
+                              const isCompleted = isTask && isTaskCompleted(ev);
+                              const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
+                              const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+                              const startStr = formatEventStartTime(ev);
+
+                              return (
+                                <div
+                                  key={ev.id}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setPreviewEvent(ev);
+                                  }}
+                                  style={{
+                                    top: `${item.topPx}px`,
+                                    height: `${item.heightPx}px`,
+                                    left: `${item.leftPercent}%`,
+                                    width:
+                                      item.widthPercent === 100
+                                        ? 'calc(100% - 1px)'
+                                        : `calc(${item.widthPercent}% - 1px)`,
+                                    backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
+                                    color: isCompleted ? '#6b7280' : colorDef.contrastText,
+                                    borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.12)',
+                                    opacity: isCompleted ? 0.55 : 1,
+                                    zIndex: item.zIndex ?? 10,
+                                  }}
+                                  className={`absolute rounded px-0.5 sm:px-1 py-0.5 text-left shadow-2xs cursor-pointer overflow-hidden transition-all hover:z-40 hover:shadow-md border select-none group min-w-0 flex flex-col items-start justify-start ${
+                                    isCompleted ? 'hover:opacity-85' : 'hover:brightness-95'
+                                  }`}
+                                  title={`${startStr ? `${startStr} ` : ''}${ev.summary}`}
+                                >
+                                  <div className="flex flex-col items-start justify-start text-left leading-tight w-full overflow-hidden">
+                                    <span className={`font-semibold text-[7px] sm:text-[9px] md:text-[10px] truncate w-full text-left leading-tight ${isCompleted ? 'line-through opacity-75' : ''}`}>
+                                      {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                                      <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
+                                      {cleanTaskTitle(ev.summary)}
+                                    </span>
+                                  </div>
+                                  {item.heightPx >= 44 && ev.location && (
+                                    <div className="text-[7px] sm:text-[8px] opacity-85 truncate flex items-center gap-0.5 mt-0.5 hidden sm:flex text-left">
+                                      <MapPin className="w-2 sm:w-2.5 h-2 sm:h-2.5 shrink-0 opacity-75" />
+                                      <span className="truncate">{ev.location}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            });
+                          })()}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            );
+          };
+
+          return (
+            <div className="w-full min-w-0 max-w-full h-full flex-1 flex flex-col bg-white overflow-hidden">
+              {/* Sub-Bar: Week toggle & Scroll to hours 6-20 */}
+              <div className="px-1.5 sm:px-3 py-1 border-b border-neutral-200 bg-neutral-50/90 flex flex-wrap items-center justify-between gap-1 shrink-0 overflow-x-hidden">
+                <div className="flex items-center gap-1 min-w-0">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider hidden sm:inline mr-1">
+                    Widok:
+                  </span>
+                  <div className="inline-flex rounded-lg bg-neutral-200/70 p-0.5 text-xs border border-neutral-300/60 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setTwoWeeksFilter('all')}
+                      className={`px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-semibold transition cursor-pointer ${
+                        twoWeeksFilter === 'all'
+                          ? 'bg-white text-blue-700 shadow-2xs font-bold'
+                          : 'text-neutral-600 hover:text-neutral-900'
+                      }`}
+                    >
+                      <span className="sm:hidden">2 tyg. (pionowo)</span>
+                      <span className="hidden sm:inline">2 tygodnie (pionowo)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTwoWeeksFilter('w1')}
+                      className={`px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-semibold transition cursor-pointer ${
+                        twoWeeksFilter === 'w1'
+                          ? 'bg-white text-blue-700 shadow-2xs font-bold'
+                          : 'text-neutral-600 hover:text-neutral-900'
+                      }`}
+                    >
+                      <span className="sm:hidden">Tydz. 1</span>
+                      <span className="hidden sm:inline">1. tydzień ({w1Days[0]?.date.getDate()} – {w1Days[6]?.date.getDate()} {w1Days[0] ? MONTH_NAMES_GENITIVE_PL[w1Days[0].date.getMonth()] : ''})</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTwoWeeksFilter('w2')}
+                      className={`px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-semibold transition cursor-pointer ${
+                        twoWeeksFilter === 'w2'
+                          ? 'bg-white text-blue-700 shadow-2xs font-bold'
+                          : 'text-neutral-600 hover:text-neutral-900'
+                      }`}
+                    >
+                      <span className="sm:hidden">Tydz. 2</span>
+                      <span className="hidden sm:inline">2. tydzień ({w2Days[0]?.date.getDate()} – {w2Days[6]?.date.getDate()} {w2Days[0] ? MONTH_NAMES_GENITIVE_PL[w2Days[0].date.getMonth()] : ''})</span>
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleScrollToDefaultHours}
+                  className="inline-flex items-center space-x-1 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg bg-white hover:bg-neutral-50 active:bg-neutral-100 text-neutral-700 border border-neutral-250 text-[10px] sm:text-xs font-semibold shadow-2xs transition cursor-pointer ml-auto shrink-0"
+                  title="Przewiń siatkę do domyślnych godzin 6:00 – 20:00"
+                >
+                  <Clock className="w-3 sm:w-3.5 h-3 sm:h-3.5 text-blue-600 shrink-0" />
+                  <span className="hidden sm:inline">Godz. 6 – 20</span>
+                  <span className="sm:hidden">6–20</span>
+                </button>
+              </div>
+
+              {/* Main Content: Vertical 2-week view (Week 1 on top, Week 2 below, one above the other) */}
+              {twoWeeksFilter === 'w1' ? (
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden w-full">
+                  <div className="px-2 sm:px-3 py-1 bg-blue-50/80 border-b border-blue-200 text-[10px] sm:text-xs font-bold text-blue-900 uppercase tracking-wider flex items-center justify-between shrink-0">
+                    <span>Tydzień 1: {w1Days[0]?.date.getDate()} – {w1Days[6]?.date.getDate()} {w1Days[0] ? MONTH_NAMES_GENITIVE_PL[w1Days[0].date.getMonth()] : ''} {w1Days[0]?.date.getFullYear()}</span>
+                    <span className="text-neutral-400 font-normal lowercase">(godziny 6:00 – 20:00 domyślnie)</span>
+                  </div>
+                  {renderWeekColumns(w1Days, twoWeeksScrollRef1, true)}
+                </div>
+              ) : twoWeeksFilter === 'w2' ? (
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden w-full">
+                  <div className="px-2 sm:px-3 py-1 bg-indigo-50/80 border-b border-indigo-200 text-[10px] sm:text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center justify-between shrink-0">
+                    <span>Tydzień 2: {w2Days[0]?.date.getDate()} – {w2Days[6]?.date.getDate()} {w2Days[0] ? MONTH_NAMES_GENITIVE_PL[w2Days[0].date.getMonth()] : ''} {w2Days[0]?.date.getFullYear()}</span>
+                    <span className="text-neutral-400 font-normal lowercase">(godziny 6:00 – 20:00 domyślnie)</span>
+                  </div>
+                  {renderWeekColumns(w2Days, twoWeeksScrollRef2, true)}
+                </div>
+              ) : (
+                /* Both weeks vertically stacked: Week 1 on top, Week 2 below ("jeden nad drugim") */
+                <div className="flex-1 min-h-0 flex flex-col divide-y-2 divide-neutral-250 overflow-hidden w-full max-w-full">
+                  {/* Week 1 Block (Top) */}
+                  <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-white w-full">
+                    <div className="px-2 sm:px-3 py-0.5 sm:py-1 bg-blue-50/80 border-b border-blue-200 text-[10px] sm:text-xs font-bold text-blue-900 uppercase tracking-wider flex items-center justify-between shrink-0">
+                      <div className="flex items-center space-x-1.5 truncate">
+                        <span className="bg-blue-600 text-white rounded px-1.5 py-0.5 text-[9px] sm:text-[10px] font-bold">1</span>
+                        <span className="truncate">
+                          Tydzień 1: {w1Days[0]?.date.getDate()} – {w1Days[6]?.date.getDate()} {w1Days[0] ? MONTH_NAMES_GENITIVE_PL[w1Days[0].date.getMonth()] : ''} {w1Days[0]?.date.getFullYear()}
+                        </span>
+                      </div>
+                      <div className="flex items-center space-x-1 shrink-0 ml-1">
+                        <span className="text-neutral-400 font-normal text-[9px] sm:text-[10px] hidden sm:inline lowercase">
+                          (niezależne przewijanie)
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => twoWeeksScrollRef1.current?.scrollTo({ top: 6 * hourHeight, behavior: 'smooth' })}
+                          className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-white hover:bg-blue-100 text-blue-700 border border-blue-200/80 shadow-2xs transition cursor-pointer font-medium"
+                          title="Przewiń Tydzień 1 do 6:00 – 20:00"
+                        >
+                          6:00–20:00
+                        </button>
+                      </div>
+                    </div>
+                    {renderWeekColumns(w1Days, twoWeeksScrollRef1, true)}
+                  </div>
+
+                  {/* Week 2 Block (Bottom) */}
+                  <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-white w-full">
+                    <div className="px-2 sm:px-3 py-0.5 sm:py-1 bg-indigo-50/80 border-b border-indigo-200 text-[10px] sm:text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center justify-between shrink-0">
+                      <div className="flex items-center space-x-1.5 truncate">
+                        <span className="bg-indigo-600 text-white rounded px-1.5 py-0.5 text-[9px] sm:text-[10px] font-bold">2</span>
+                        <span className="truncate">
+                          Tydzień 2: {w2Days[0]?.date.getDate()} – {w2Days[6]?.date.getDate()} {w2Days[0] ? MONTH_NAMES_GENITIVE_PL[w2Days[0].date.getMonth()] : ''} {w2Days[0]?.date.getFullYear()}
+                        </span>
+                      </div>
+                      <div className="flex items-center space-x-1 shrink-0 ml-1">
+                        <span className="text-neutral-400 font-normal text-[9px] sm:text-[10px] hidden sm:inline lowercase">
+                          (niezależne przewijanie)
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => twoWeeksScrollRef2.current?.scrollTo({ top: 6 * hourHeight, behavior: 'smooth' })}
+                          className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 shadow-2xs transition cursor-pointer font-medium"
+                          title="Przewiń Tydzień 2 do 6:00 – 20:00"
+                        >
+                          6:00–20:00
+                        </button>
+                      </div>
+                    </div>
+                    {renderWeekColumns(w2Days, twoWeeksScrollRef2, true)}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* VIEW 4: 4 Tygodnie (4 Weeks view) */}
         {viewMode === '4tygodnie' && (

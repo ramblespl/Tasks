@@ -1,5 +1,6 @@
 import { GoogleTaskList, GoogleTaskItem } from '../types';
 import { refreshGoogleTokenSilently, clearStoredAuth } from './firebaseAuth';
+import { getTaskAssignedTime } from './templateStorage';
 
 const fetchTasksWithRetry = async (
   url: string,
@@ -199,21 +200,36 @@ export const getTasksInList = async (
     pageToken = data.nextPageToken;
   } while (pageToken);
 
-  return allItems.map((item: any) => ({
-    id: item.id,
-    title: item.title || '(Bez tytułu)',
-    notes: item.notes,
-    due: item.due,
-    status: item.status as 'needsAction' | 'completed',
-    completed: item.completed,
-    updated: item.updated,
-  }));
+  return allItems.map((item: any) => {
+    let taskTime: string | undefined = getTaskAssignedTime(item.id) || undefined;
+    if (!taskTime && item.due && item.due.includes('T')) {
+      const isDateOnlyMidnight = /T00:00:00(\.000)?Z$/i.test(item.due);
+      if (!isDateOnlyMidnight) {
+        const d = new Date(item.due);
+        if (!isNaN(d.getTime())) {
+          const pad = (n: number) => String(n).padStart(2, '0');
+          taskTime = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+      }
+    }
+
+    return {
+      id: item.id,
+      title: item.title || '(Bez tytułu)',
+      notes: item.notes,
+      due: item.due,
+      time: taskTime,
+      status: item.status as 'needsAction' | 'completed',
+      completed: item.completed,
+      updated: item.updated,
+    };
+  });
 };
 
 export interface CreateTaskPayload {
   title: string;
   notes?: string;
-  due?: string; // RFC 3339 timestamp (e.g. 2026-10-15T00:00:00.000Z)
+  due?: string; // RFC 3339 timestamp (e.g. 2026-10-15T00:00:00.000Z or with time)
 }
 
 export const createGoogleTask = async (
@@ -260,11 +276,24 @@ export const createGoogleTask = async (
   }
 
   const item = await response.json();
+  let taskTime: string | undefined = getTaskAssignedTime(item.id) || undefined;
+  if (!taskTime && payload.due && payload.due.includes('T')) {
+    const isDateOnlyMidnight = /T00:00:00(\.000)?Z$/i.test(payload.due);
+    if (!isDateOnlyMidnight) {
+      const d = new Date(payload.due);
+      if (!isNaN(d.getTime())) {
+        const pad = (n: number) => String(n).padStart(2, '0');
+        taskTime = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      }
+    }
+  }
+
   return {
     id: item.id,
     title: item.title,
     notes: item.notes,
-    due: item.due,
+    due: payload.due || item.due,
+    time: taskTime,
     status: item.status,
     completed: item.completed,
     updated: item.updated,

@@ -100,6 +100,13 @@ export const MobileWidgetsModal: React.FC<MobileWidgetsModalProps> = ({
       borderHover: 'hover:border-indigo-400',
     },
     {
+      id: 'cal_2weeks',
+      icon: <CalendarRange className="w-5 h-5" />,
+      colorBg: 'bg-blue-100 text-blue-700',
+      colorText: 'text-blue-700',
+      borderHover: 'hover:border-blue-400',
+    },
+    {
       id: 'cal_week',
       icon: <CalendarDays className="w-5 h-5" />,
       colorBg: 'bg-sky-100 text-sky-700',

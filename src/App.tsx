@@ -81,6 +81,8 @@ import {
   generateIcsForTripTasks,
   cleanTaskTitle,
   extractTaskTitleAndTime,
+  saveTaskAssignedTime,
+  formatToRfc3339,
   loadTemplateSets,
   saveTemplateSets,
   getActiveTemplateSet,
@@ -1745,10 +1747,10 @@ export default function App() {
     }
   };
 
-  // Update task (title, due, notes) with ability to assign/move to another task list
+  // Update task (title, due, notes, time) with ability to assign/move to another task list
   const handleUpdateTask = async (
     taskId: string,
-    patch: { title?: string; notes?: string; due?: string },
+    patch: { title?: string; notes?: string; due?: string; time?: string },
     newTaskListId?: string,
     oldTaskListId?: string
   ) => {
@@ -1767,6 +1769,10 @@ export default function App() {
     }
 
     try {
+      if (patch.time !== undefined) {
+        saveTaskAssignedTime(taskId, patch.time || null);
+      }
+
       // Check if user requested moving to a different list
       if (newTaskListId && newTaskListId !== ALL_TASK_LISTS_ID && newTaskListId !== sourceListId) {
         const targetList = taskLists.find((l) => l.id === newTaskListId);
@@ -1777,6 +1783,10 @@ export default function App() {
           status: existing?.status,
         });
 
+        if (patch.time !== undefined) {
+          saveTaskAssignedTime(moved.id, patch.time || null);
+        }
+
         // Update local tasks list with new ID and target list metadata
         setTasks((prev) =>
           prev.map((t) =>
@@ -1785,6 +1795,7 @@ export default function App() {
                   ...t,
                   id: moved.id,
                   ...patch,
+                  time: patch.time !== undefined ? (patch.time || undefined) : t.time,
                   taskListId: newTaskListId,
                   taskListTitle: targetList?.title || t.taskListTitle,
                 }
@@ -1797,9 +1808,21 @@ export default function App() {
         );
       } else {
         // Normal update in current list
-        await updateGoogleTask(token, sourceListId, taskId, patch);
+        await updateGoogleTask(token, sourceListId, taskId, {
+          title: patch.title,
+          notes: patch.notes,
+          due: patch.due,
+        });
         setTasks((prev) =>
-          prev.map((t) => (t.id === taskId ? { ...t, ...patch } : t))
+          prev.map((t) =>
+            t.id === taskId
+              ? {
+                  ...t,
+                  ...patch,
+                  time: patch.time !== undefined ? (patch.time || undefined) : t.time,
+                }
+              : t
+          )
         );
         addLog(`Zaktualizowano zadanie "${patch.title || 'zadanie'}" w Google Tasks`, 'success');
       }
@@ -2229,13 +2252,14 @@ export default function App() {
     }
   };
 
-  // Add task manually to a specific target list
+  // Add task manually to a specific target list with optional assigned time
   const handleAddTaskManually = async (
     title: string,
     notes?: string,
     due?: string,
-    targetTaskListId?: string
-  ) => {
+    targetTaskListId?: string,
+    time?: string
+  ): Promise<GoogleTaskItem | void> => {
     if (!token) return;
     const effectiveListId =
       targetTaskListId ||
@@ -2248,19 +2272,39 @@ export default function App() {
 
     try {
       const cleanTitle = cleanTaskTitle(title);
+      let rfcDue = due;
+      if (due && time) {
+        const datePart = due.includes('T') ? due.split('T')[0] : due;
+        const [year, month, day] = datePart.split('-').map(Number);
+        const [hours, minutes] = time.split(':').map(Number);
+        const dateObj = new Date(year, (month || 1) - 1, day || 1, hours || 0, minutes || 0, 0);
+        rfcDue = formatToRfc3339(dateObj);
+      } else if (due && !due.includes('T')) {
+        const [year, month, day] = due.split('-').map(Number);
+        const dateObj = new Date(Date.UTC(year, (month || 1) - 1, day || 1, 0, 0, 0));
+        rfcDue = dateObj.toISOString();
+      }
+
       const newTask = await createGoogleTask(token, effectiveListId, {
         title: cleanTitle,
         notes: notes || undefined,
-        due,
+        due: rfcDue,
       });
+
+      if (time) {
+        saveTaskAssignedTime(newTask.id, time);
+      }
+
       const taskWithList: GoogleTaskItem = {
         ...newTask,
+        due: rfcDue || newTask.due,
+        time: time || undefined,
         taskListId: effectiveListId,
         taskListTitle: targetListObj?.title || 'Zadania',
       };
       setTasks((prev) => [taskWithList, ...prev]);
       addLog(
-        `Dodano nowe zadanie "${cleanTitle}" do listy "${targetListObj?.title || effectiveListId}"`,
+        `Dodano nowe zadanie "${cleanTitle}"${time ? ` (godz. ${time})` : ''} do listy "${targetListObj?.title || effectiveListId}"`,
         'success'
       );
 
@@ -2278,10 +2322,15 @@ export default function App() {
           const recreated = await createGoogleTask(token, effectiveListId, {
             title: cleanTitle,
             notes: notes || undefined,
-            due,
+            due: rfcDue,
           });
+          if (time) {
+            saveTaskAssignedTime(recreated.id, time);
+          }
           const recreatedTask: GoogleTaskItem = {
             ...recreated,
+            due: rfcDue || recreated.due,
+            time: time || undefined,
             taskListId: effectiveListId,
             taskListTitle: targetListObj?.title || 'Zadania',
           };
@@ -2289,6 +2338,8 @@ export default function App() {
           addLog(`Ponowiono utworzenie zadania "${cleanTitle}"`, 'info');
         },
       });
+
+      return taskWithList;
     } catch (err: any) {
       addLog(`Nie udało się dodać zadania: ${err.message}`, 'error');
       throw err;
@@ -2762,6 +2813,7 @@ export default function App() {
               onToggleTask={handleToggleTask}
               onUpdateTask={handleUpdateTask}
               onDeleteTask={handleDeleteTask}
+              onAddTaskManually={handleAddTaskManually}
               onAddTaskToCalendar={handleAddTaskToCalendar}
               showTaskListsFilter={true}
               isSidebarOpen={isAppSidebarOpen}
@@ -2937,6 +2989,8 @@ export default function App() {
                   dateRange={dashboardCalendarDateRange}
                   onChangeDateRange={setDashboardCalendarDateRange}
                   tasks={tasks}
+                  taskLists={taskLists}
+                  onAddTaskManually={handleAddTaskManually}
                   showControls={dashboardCalendarControlsOpen}
                   onToggleControls={() => setDashboardCalendarControlsOpen((p) => !p)}
                 />

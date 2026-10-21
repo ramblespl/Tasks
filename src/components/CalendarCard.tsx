@@ -20,10 +20,12 @@ import {
   Layers,
   RotateCcw,
   MoreHorizontal,
+  ListTodo,
 } from 'lucide-react';
-import { CalendarListItem, CalendarEventItem, TaskTemplateItem, TaskTemplateSet, GoogleTaskItem } from '../types';
-import { calculateDueDateDetails, cleanTaskTitle } from '../services/templateStorage';
+import { CalendarListItem, CalendarEventItem, TaskTemplateItem, TaskTemplateSet, GoogleTaskItem, GoogleTaskList } from '../types';
+import { calculateDueDateDetails, cleanTaskTitle, formatToRfc3339 } from '../services/templateStorage';
 import { ALL_CALENDARS_ID, ALL_CALENDARS_ITEM, findPrimaryCalendar, getEventDateSpan, isEventLongerThan24hOrAllDay, getInclusiveAllDayEndDate } from '../services/googleCalendarApi';
+import { ALL_TASK_LISTS_ID } from '../services/googleTasksApi';
 import { ChecklistPopover, ChecklistOption } from './ChecklistPopover';
 import { DateRangeFilterBar } from './DateRangeFilterBar';
 import { AndroidTimePickerField } from './AndroidTimePicker';
@@ -106,6 +108,14 @@ interface CalendarCardProps {
   dateRange?: DateRangeState;
   onChangeDateRange?: (newRange: DateRangeState) => void;
   tasks?: GoogleTaskItem[];
+  taskLists?: GoogleTaskList[];
+  onAddTaskManually?: (
+    title: string,
+    notes?: string,
+    due?: string,
+    targetTaskListId?: string,
+    time?: string
+  ) => Promise<GoogleTaskItem | void>;
   showControls?: boolean;
   onToggleControls?: () => void;
 }
@@ -141,6 +151,8 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
   dateRange: propDateRange,
   onChangeDateRange,
   tasks = [],
+  taskLists = [],
+  onAddTaskManually,
   showControls,
   onToggleControls,
 }) => {
@@ -156,6 +168,7 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
   // In-app Calendar Event Add/Edit Modal state
   const [showEventModal, setShowEventModal] = useState(false);
   const [editingEvent, setEditingEvent] = useState<CalendarEventItem | null>(null);
+  const [createItemType, setCreateItemType] = useState<'event' | 'task'>('event');
   const [eventCalendarId, setEventCalendarId] = useState<string>('');
   const [eventSummary, setEventSummary] = useState('');
   const [eventIsAllDay, setEventIsAllDay] = useState(true);
@@ -168,6 +181,14 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
   const [eventColorId, setEventColorId] = useState<string>('');
   const [isSavingEvent, setIsSavingEvent] = useState(false);
   const [eventModalError, setEventModalError] = useState<string | null>(null);
+
+  // Task creation fields in modal
+  const [modalTaskTitle, setModalTaskTitle] = useState('');
+  const [modalTaskTargetListId, setModalTaskTargetListId] = useState('');
+  const [modalTaskDate, setModalTaskDate] = useState(getTodayDateString);
+  const [modalTaskHasTime, setModalTaskHasTime] = useState(false);
+  const [modalTaskTime, setModalTaskTime] = useState('12:00');
+  const [modalTaskNotes, setModalTaskNotes] = useState('');
 
   const handleStartTimeChange = (newStartTime: string) => {
     setEventStartTime(newStartTime);
@@ -481,8 +502,9 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
   };
 
   // Open Event Modal in Add mode
-  const handleOpenAddEvent = () => {
+  const handleOpenAddEvent = (defaultType: 'event' | 'task' = 'event') => {
     setEditingEvent(null);
+    setCreateItemType(defaultType);
     setEventSummary('');
     setEventIsAllDay(true);
     const defaultCalId =
@@ -498,8 +520,71 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
     setEventLocation('');
     setEventDescription('');
     setEventColorId('');
+
+    // Task fields initialization
+    setModalTaskTitle('');
+    setModalTaskDate(todayStr);
+    const defaultTaskListId =
+      (taskLists.find((tl) => tl.id !== ALL_TASK_LISTS_ID && (tl.title?.toLowerCase().includes('zadania') || tl.title?.toLowerCase().includes('tasks')))?.id) ||
+      taskLists.find((tl) => tl.id !== ALL_TASK_LISTS_ID)?.id ||
+      '';
+    setModalTaskTargetListId(defaultTaskListId);
+    setModalTaskHasTime(false);
+    setModalTaskTime('12:00');
+    setModalTaskNotes('');
+
     setEventModalError(null);
     setShowEventModal(true);
+  };
+
+  // Submit handler for creating a task from the modal in CalendarCard
+  const handleSaveModalTaskSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!modalTaskTitle.trim()) {
+      setEventModalError('Wprowadź nazwę zadania.');
+      return;
+    }
+    if (!onAddTaskManually) {
+      setEventModalError('Brak dostępnej funkcji dodawania zadań.');
+      return;
+    }
+
+    try {
+      setIsSavingEvent(true);
+      setEventModalError(null);
+      const clean = cleanTaskTitle(modalTaskTitle.trim());
+
+      let taskHour: string | undefined = undefined;
+      if (modalTaskHasTime && modalTaskTime && /^(\d{1,2}):(\d{2})$/.test(modalTaskTime)) {
+        taskHour = modalTaskTime;
+      }
+
+      let rfcDue: string | undefined = undefined;
+      if (modalTaskDate) {
+        const [year, month, day] = modalTaskDate.split('-').map(Number);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        if (taskHour) {
+          let [h, m] = taskHour.split(':').map(Number);
+          if (isNaN(h)) h = 12;
+          if (isNaN(m)) m = 0;
+          const target = new Date(year, (month || 1) - 1, day || 1, h, m, 0, 0);
+          rfcDue = formatToRfc3339(target);
+        } else {
+          rfcDue = `${year}-${pad(month)}-${pad(day)}T00:00:00.000Z`;
+        }
+      }
+
+      const finalNotes = modalTaskNotes.trim() ? modalTaskNotes.trim() : undefined;
+      const targetListId = modalTaskTargetListId || undefined;
+
+      await onAddTaskManually(clean, finalNotes, rfcDue, targetListId, taskHour);
+      setShowEventModal(false);
+    } catch (err: any) {
+      console.error('Błąd zapisu zadania:', err);
+      setEventModalError(err.message || 'Nie udało się zapisać zadania w Google Tasks.');
+    } finally {
+      setIsSavingEvent(false);
+    }
   };
 
   // Open Event Modal in Edit mode
@@ -2235,15 +2320,31 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
           >
             <div className="flex items-center justify-between pb-2.5 sm:pb-3 border-b border-neutral-100 shrink-0">
               <div className="flex items-center space-x-2.5">
-                <div className="w-9 h-9 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
-                  <CalendarIcon className="w-5 h-5" />
+                <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
+                  createItemType === 'task' && !editingEvent
+                    ? 'bg-emerald-100 text-emerald-700'
+                    : 'bg-blue-100 text-blue-700'
+                }`}>
+                  {createItemType === 'task' && !editingEvent ? (
+                    <ListTodo className="w-5 h-5" />
+                  ) : (
+                    <CalendarIcon className="w-5 h-5" />
+                  )}
                 </div>
                 <div>
                   <h3 className="text-base font-bold text-neutral-900 leading-snug">
-                    {editingEvent ? 'Edytuj wydarzenie w kalendarzu' : 'Nowe wydarzenie w kalendarzu'}
+                    {editingEvent
+                      ? 'Edytuj wydarzenie w kalendarzu'
+                      : createItemType === 'task'
+                        ? 'Nowe zadanie w Google Tasks'
+                        : 'Nowe wydarzenie w kalendarzu'}
                   </h3>
                   <p className="text-xs text-neutral-500">
-                    Wprowadź dane wydarzenia i przypisz do wybranego kalendarza
+                    {editingEvent
+                      ? 'Dostosuj szczegóły istniejącego wydarzenia'
+                      : createItemType === 'task'
+                        ? 'Dodaj zadanie z terminem i opcjonalną godziną'
+                        : 'Wprowadź dane wydarzenia i przypisz do kalendarza'}
                   </p>
                 </div>
               </div>
@@ -2256,6 +2357,36 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
               </button>
             </div>
 
+            {/* Google Calendar style type switcher: Wydarzenie vs Zadanie */}
+            {!editingEvent && (
+              <div className="flex items-center gap-1.5 p-1 bg-neutral-100/90 rounded-xl mt-3 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setCreateItemType('event')}
+                  className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                    createItemType === 'event'
+                      ? 'bg-white text-blue-700 shadow-xs'
+                      : 'text-neutral-600 hover:text-neutral-900'
+                  }`}
+                >
+                  <CalendarIcon className="w-3.5 h-3.5" />
+                  <span>Wydarzenie</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCreateItemType('task')}
+                  className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                    createItemType === 'task'
+                      ? 'bg-white text-emerald-700 shadow-xs'
+                      : 'text-neutral-600 hover:text-neutral-900'
+                  }`}
+                >
+                  <ListTodo className="w-3.5 h-3.5" />
+                  <span>Zadanie</span>
+                </button>
+              </div>
+            )}
+
             {eventModalError && (
               <div className="mt-2.5 sm:mt-3 p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-start space-x-2 shrink-0">
                 <AlertCircle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
@@ -2263,204 +2394,129 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
               </div>
             )}
 
-            <form onSubmit={handleSaveEventSubmit} className="flex-1 min-h-0 flex flex-col mt-2.5 sm:mt-3">
-              <div className="overflow-y-auto min-h-0 flex-1 pr-1 sm:pr-1.5 space-y-3 sm:space-y-3.5">
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                    Kalendarz Google *
-                  </label>
-                  <select
-                    value={eventCalendarId}
-                    onChange={(e) => setEventCalendarId(e.target.value)}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
-                  >
-                    {calendars
-                      .filter((c) => c.id !== ALL_CALENDARS_ID)
-                      .map((cal) => (
-                        <option key={cal.id} value={cal.id}>
-                          {cal.summary
-                            ?.replace(/\s*[([](?:główny|glowny|primary)[)\]]/gi, '')
-                            ?.replace(/\s*-\s*(?:główny|glowny|primary)/gi, '')
-                            ?.trim() || cal.summary}
-                        </option>
-                      ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                    Nazwa wydarzenia *
-                  </label>
-                  <input
-                    type="text"
-                    value={eventSummary}
-                    onChange={(e) => setEventSummary(e.target.value)}
-                    placeholder="np. Spotkanie projektowe, Warsztaty, Konferencja"
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                    required
-                  />
-                </div>
-
-                {/* All-day toggle */}
-                <div className="flex items-center justify-between p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
-                  <span className="text-xs font-medium text-neutral-700">Wydarzenie całodniowe</span>
-                  <input
-                    type="checkbox"
-                    checked={eventIsAllDay}
-                    onChange={(e) => setEventIsAllDay(e.target.checked)}
-                    className="w-4 h-4 text-blue-600 rounded border-neutral-300 focus:ring-blue-500 cursor-pointer"
-                  />
-                </div>
-
-                {/* Dates and Times */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {/* TASK CREATION FORM */}
+            {!editingEvent && createItemType === 'task' ? (
+              <form onSubmit={handleSaveModalTaskSubmit} className="flex-1 min-h-0 flex flex-col mt-2.5 sm:mt-3">
+                <div className="overflow-y-auto min-h-0 flex-1 pr-1 sm:pr-1.5 space-y-3 sm:space-y-3.5">
                   <div>
-                    <label className="block text-[11px] font-medium text-neutral-600 mb-1">
-                      Data rozpoczęcia *
+                    <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                      Lista zadań Google Tasks *
                     </label>
-                    <input
-                      type="date"
-                      value={eventStartDate}
-                      onChange={(e) => {
-                        setEventStartDate(e.target.value);
-                        if (eventEndDate && e.target.value > eventEndDate) {
-                          setEventEndDate(e.target.value);
-                        }
-                      }}
-                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
-                      required
-                    />
-                    {!eventIsAllDay && (
-                      <div className="mt-2">
-                        <AndroidTimePickerField
-                          label="Godzina rozpoczęcia"
-                          value={eventStartTime}
-                          onChange={(newTime) => handleStartTimeChange(newTime)}
-                          title="Godzina rozpoczęcia wydarzenia"
-                        />
-                      </div>
-                    )}
+                    <select
+                      value={modalTaskTargetListId}
+                      onChange={(e) => setModalTaskTargetListId(e.target.value)}
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white font-medium cursor-pointer"
+                    >
+                      {taskLists
+                        .filter((tl) => tl.id !== ALL_TASK_LISTS_ID)
+                        .map((tl) => (
+                          <option key={tl.id} value={tl.id}>
+                            {tl.title}
+                          </option>
+                        ))}
+                    </select>
                   </div>
 
                   <div>
-                    <label className="block text-[11px] font-medium text-neutral-600 mb-1">
-                      Data zakończenia (powrót)
+                    <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                      Nazwa zadania *
                     </label>
-                    <input
-                      type="date"
-                      value={eventEndDate}
-                      min={eventStartDate}
-                      onChange={(e) => setEventEndDate(e.target.value)}
-                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
-                    />
-                    {!eventIsAllDay && (
-                      <div className="mt-2">
-                        <AndroidTimePickerField
-                          label="Godzina zakończenia"
-                          value={eventEndTime}
-                          onChange={(newTime) => setEventEndTime(newTime)}
-                          title="Godzina zakończenia wydarzenia"
-                        />
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                    Lokalizacja (opcjonalnie)
-                  </label>
-                  <div className="relative">
-                    <MapPin className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-3 pointer-events-none" />
                     <input
                       type="text"
-                      value={eventLocation}
-                      onChange={(e) => setEventLocation(e.target.value)}
-                      placeholder="np. Rzym, Włochy / Hotel Colosseo"
-                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg pl-8 p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      value={modalTaskTitle}
+                      onChange={(e) => setModalTaskTitle(e.target.value)}
+                      placeholder="np. Pakowanie, Zrobić przelew, Sprawdzić bilety"
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white"
+                      required
+                      autoFocus
+                    />
+                  </div>
+
+                  {/* Termin i godzina wykonania */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-semibold text-neutral-700">
+                        Termin wykonania (data) *
+                      </label>
+                      {modalTaskDate && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setModalTaskDate('');
+                            setModalTaskHasTime(false);
+                          }}
+                          className="text-[10px] text-neutral-400 hover:text-rose-600 transition cursor-pointer"
+                        >
+                          Wyczyść termin
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      type="date"
+                      value={modalTaskDate}
+                      onChange={(e) => setModalTaskDate(e.target.value)}
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-emerald-500 focus:outline-none bg-white"
+                      required
+                    />
+                  </div>
+
+                  {/* Przycisk 'Dodaj termin' (godzina) / Pole godziny */}
+                  {modalTaskDate && !modalTaskHasTime && (
+                    <div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setModalTaskHasTime(true);
+                          if (!modalTaskTime) setModalTaskTime('12:00');
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-xl transition cursor-pointer"
+                        title="Dodaj konkretną godzinę do zadania"
+                      >
+                        <Clock className="w-4 h-4 text-emerald-600" />
+                        <span>Dodaj termin (godzina)</span>
+                      </button>
+                    </div>
+                  )}
+
+                  {modalTaskDate && modalTaskHasTime && (
+                    <div className="p-3 rounded-xl bg-neutral-50 border border-neutral-200 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-semibold text-neutral-700 flex items-center gap-1.5">
+                          <Clock className="w-3.5 h-3.5 text-emerald-600" />
+                          <span>Przypisana godzina zadania</span>
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => setModalTaskHasTime(false)}
+                          className="text-[11px] text-neutral-400 hover:text-rose-600 transition cursor-pointer"
+                        >
+                          Usuń godzinę (cały dzień)
+                        </button>
+                      </div>
+                      <AndroidTimePickerField
+                        label="Wybierz godzinę zadania"
+                        value={modalTaskTime || '12:00'}
+                        onChange={(t) => setModalTaskTime(t)}
+                        title="Godzina wykonania zadania"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                      Opis / Notatki (opcjonalnie)
+                    </label>
+                    <textarea
+                      value={modalTaskNotes}
+                      onChange={(e) => setModalTaskNotes(e.target.value)}
+                      placeholder="Dodatkowe informacje do zadania..."
+                      rows={2}
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
                     />
                   </div>
                 </div>
 
-                <div>
-                  <label className="block text-xs font-semibold text-neutral-700 mb-1">
-                    Opis / Notatki (opcjonalnie)
-                  </label>
-                  <textarea
-                    value={eventDescription}
-                    onChange={(e) => setEventDescription(e.target.value)}
-                    placeholder="Dodatkowe informacje, nr lotu, potwierdzenie..."
-                    rows={2}
-                    className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                  />
-                </div>
-
-                {/* Google Calendar Event Color Picker */}
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-xs font-semibold text-neutral-700">
-                      Kolor w Kalendarzu Google
-                    </label>
-                    <span className="text-[11px] font-medium text-neutral-500">
-                      {GOOGLE_EVENT_COLOR_OPTIONS.find((c) => c.id === eventColorId)?.name || 'Domyślny kolor kalendarza'}
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
-                    <button
-                      type="button"
-                      onClick={() => setEventColorId('')}
-                      className={`px-2.5 py-1 text-xs rounded-lg border transition-all cursor-pointer ${
-                        !eventColorId
-                          ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
-                          : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
-                      }`}
-                      title="Użyj domyślnego koloru kalendarza"
-                    >
-                      Domyślny
-                    </button>
-                    {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
-                      const isSelected = (eventColorId || '') === col.id;
-                      return (
-                        <button
-                          key={col.id}
-                          type="button"
-                          onClick={() => setEventColorId(col.id)}
-                          className={`w-7 h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
-                            isSelected
-                              ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
-                              : 'hover:scale-105 opacity-90 hover:opacity-100'
-                          }`}
-                          style={{ backgroundColor: col.hex }}
-                          title={`${col.name} (Google ID: ${col.id})`}
-                        >
-                          {isSelected && (
-                            <span
-                              className="text-xs font-black leading-none"
-                              style={{ color: col.contrastText }}
-                            >
-                              ✓
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-
-              <div className="shrink-0 pt-3 border-t border-neutral-100 mt-2 bg-white flex flex-wrap items-center justify-between gap-2">
-                <button
-                  type="button"
-                  onClick={handleSaveAndGenerateTasks}
-                  disabled={isSavingEvent}
-                  className="inline-flex items-center space-x-1.5 px-3 py-1.5 sm:px-3.5 sm:py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg shadow-2xs transition disabled:opacity-50 cursor-pointer"
-                  title="Zapisz to wydarzenie i wygeneruj dla niego zadania"
-                >
-                  <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Generuj zadania</span>
-                </button>
-
-                <div className="flex items-center space-x-2 ml-auto">
+                <div className="shrink-0 pt-3 border-t border-neutral-100 mt-2 bg-white flex items-center justify-end gap-2">
                   <button
                     type="button"
                     onClick={() => setShowEventModal(false)}
@@ -2471,8 +2527,8 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
                   </button>
                   <button
                     type="submit"
-                    disabled={isSavingEvent}
-                    className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 sm:px-4 sm:py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+                    disabled={isSavingEvent || !modalTaskTitle.trim()}
+                    className="inline-flex items-center space-x-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
                   >
                     {isSavingEvent ? (
                       <>
@@ -2480,12 +2536,249 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
                         <span>Zapisywanie...</span>
                       </>
                     ) : (
-                      <span>{editingEvent ? 'Zapisz zmiany' : 'Dodaj do kalendarza'}</span>
+                      <span>Dodaj zadanie</span>
                     )}
                   </button>
                 </div>
-              </div>
-            </form>
+              </form>
+            ) : (
+              /* EVENT CREATION / EDITING FORM */
+              <form onSubmit={handleSaveEventSubmit} className="flex-1 min-h-0 flex flex-col mt-2.5 sm:mt-3">
+                <div className="overflow-y-auto min-h-0 flex-1 pr-1 sm:pr-1.5 space-y-3 sm:space-y-3.5">
+                  <div>
+                    <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                      Kalendarz Google *
+                    </label>
+                    <select
+                      value={eventCalendarId}
+                      onChange={(e) => setEventCalendarId(e.target.value)}
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white font-medium cursor-pointer"
+                    >
+                      {calendars
+                        .filter((c) => c.id !== ALL_CALENDARS_ID)
+                        .map((cal) => (
+                          <option key={cal.id} value={cal.id}>
+                            {cal.summary
+                              ?.replace(/\s*[([](?:główny|glowny|primary)[)\]]/gi, '')
+                              ?.replace(/\s*-\s*(?:główny|glowny|primary)/gi, '')
+                              ?.trim() || cal.summary}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                      Nazwa wydarzenia *
+                    </label>
+                    <input
+                      type="text"
+                      value={eventSummary}
+                      onChange={(e) => setEventSummary(e.target.value)}
+                      placeholder="np. Spotkanie projektowe, Warsztaty, Konferencja"
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      required
+                    />
+                  </div>
+
+                  {/* All-day toggle with 'Dodaj termin' option */}
+                  <div className="flex items-center justify-between p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
+                    <span className="text-xs font-medium text-neutral-700">Wydarzenie całodniowe</span>
+                    <input
+                      type="checkbox"
+                      checked={eventIsAllDay}
+                      onChange={(e) => setEventIsAllDay(e.target.checked)}
+                      className="w-4 h-4 text-blue-600 rounded border-neutral-300 focus:ring-blue-500 cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Dates and Times */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-medium text-neutral-600 mb-1">
+                        Data rozpoczęcia *
+                      </label>
+                      <input
+                        type="date"
+                        value={eventStartDate}
+                        onChange={(e) => {
+                          setEventStartDate(e.target.value);
+                          if (eventEndDate && e.target.value > eventEndDate) {
+                            setEventEndDate(e.target.value);
+                          }
+                        }}
+                        className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
+                        required
+                      />
+                      {!eventIsAllDay ? (
+                        <div className="mt-2">
+                          <AndroidTimePickerField
+                            label="Godzina rozpoczęcia"
+                            value={eventStartTime}
+                            onChange={(newTime) => handleStartTimeChange(newTime)}
+                            title="Godzina rozpoczęcia wydarzenia"
+                          />
+                        </div>
+                      ) : (
+                        <div className="mt-2">
+                          <button
+                            type="button"
+                            onClick={() => setEventIsAllDay(false)}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition cursor-pointer"
+                            title="Dodaj godzinę rozpoczęcia wydarzenia"
+                          >
+                            <Clock className="w-3.5 h-3.5 text-blue-600" />
+                            <span>Dodaj termin (godzina)</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-medium text-neutral-600 mb-1">
+                        Data zakończenia (powrót)
+                      </label>
+                      <input
+                        type="date"
+                        value={eventEndDate}
+                        min={eventStartDate}
+                        onChange={(e) => setEventEndDate(e.target.value)}
+                        className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white"
+                      />
+                      {!eventIsAllDay && (
+                        <div className="mt-2">
+                          <AndroidTimePickerField
+                            label="Godzina zakończenia"
+                            value={eventEndTime}
+                            onChange={(newTime) => setEventEndTime(newTime)}
+                            title="Godzina zakończenia wydarzenia"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                      Lokalizacja (opcjonalnie)
+                    </label>
+                    <div className="relative">
+                      <MapPin className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-3 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={eventLocation}
+                        onChange={(e) => setEventLocation(e.target.value)}
+                        placeholder="np. Rzym, Włochy / Hotel Colosseo"
+                        className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg pl-8 p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-neutral-700 mb-1">
+                      Opis / Notatki (opcjonalnie)
+                    </label>
+                    <textarea
+                      value={eventDescription}
+                      onChange={(e) => setEventDescription(e.target.value)}
+                      placeholder="Dodatkowe informacje, nr lotu, potwierdzenie..."
+                      rows={2}
+                      className="w-full text-xs sm:text-sm border border-neutral-300 rounded-lg p-2.5 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    />
+                  </div>
+
+                  {/* Google Calendar Event Color Picker */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-semibold text-neutral-700">
+                        Kolor w Kalendarzu Google
+                      </label>
+                      <span className="text-[11px] font-medium text-neutral-500">
+                        {GOOGLE_EVENT_COLOR_OPTIONS.find((c) => c.id === eventColorId)?.name || 'Domyślny kolor kalendarza'}
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
+                      <button
+                        type="button"
+                        onClick={() => setEventColorId('')}
+                        className={`px-2.5 py-1 text-xs rounded-lg border transition-all cursor-pointer ${
+                          !eventColorId
+                            ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
+                            : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
+                        }`}
+                        title="Użyj domyślnego koloru kalendarza"
+                      >
+                        Domyślny
+                      </button>
+                      {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
+                        const isSelected = (eventColorId || '') === col.id;
+                        return (
+                          <button
+                            key={col.id}
+                            type="button"
+                            onClick={() => setEventColorId(col.id)}
+                            className={`w-7 h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
+                              isSelected
+                                ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
+                                : 'hover:scale-105 opacity-90 hover:opacity-100'
+                            }`}
+                            style={{ backgroundColor: col.hex }}
+                            title={`${col.name} (Google ID: ${col.id})`}
+                          >
+                            {isSelected && (
+                              <span
+                                className="text-xs font-black leading-none"
+                                style={{ color: col.contrastText }}
+                              >
+                                ✓
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="shrink-0 pt-3 border-t border-neutral-100 mt-2 bg-white flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSaveAndGenerateTasks}
+                    disabled={isSavingEvent}
+                    className="inline-flex items-center space-x-1.5 px-3 py-1.5 sm:px-3.5 sm:py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg shadow-2xs transition disabled:opacity-50 cursor-pointer"
+                    title="Zapisz to wydarzenie i wygeneruj dla niego zadania"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Generuj zadania</span>
+                  </button>
+
+                  <div className="flex items-center space-x-2 ml-auto">
+                    <button
+                      type="button"
+                      onClick={() => setShowEventModal(false)}
+                      disabled={isSavingEvent}
+                      className="px-3.5 py-1.5 sm:px-4 sm:py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-colors cursor-pointer"
+                    >
+                      Anuluj
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={isSavingEvent}
+                      className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 sm:px-4 sm:py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+                    >
+                      {isSavingEvent ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>Zapisywanie...</span>
+                        </>
+                      ) : (
+                        <span>{editingEvent ? 'Zapisz zmiany' : 'Dodaj do kalendarza'}</span>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </form>
+            )}
           </div>
         </div>
       )}
