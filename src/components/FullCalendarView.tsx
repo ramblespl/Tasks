@@ -56,11 +56,13 @@ import {
 } from '../utils/dateFilterUtils';
 import {
   getGoogleEventColor,
+  findColorDefinition,
   GOOGLE_EVENT_COLORS,
   GOOGLE_EVENT_COLOR_OPTIONS,
   GoogleColorDefinition,
   isCalendarTaskEvent,
   BIRCH_TASK_COLOR,
+  isPastEvent,
 } from '../utils/googleCalendarColors';
 import { computeDayTimedEventLayouts } from '../utils/calendarLayout';
 
@@ -1199,7 +1201,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     const map = new Map<string, string>();
     if (templates && templates.length > 0) {
       templates.forEach((tpl) => {
-        if (tpl.colorId && GOOGLE_EVENT_COLORS[tpl.colorId]) {
+        if (tpl.colorId) {
           map.set(cleanTaskTitle(tpl.title).toLowerCase(), tpl.colorId);
         }
       });
@@ -1314,46 +1316,99 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     return formatEventStartTime(ev);
   };
 
+  // Helper to format date as DD.MM.RRRR (np. 21.10.2026)
+  const formatDateDot = (d: Date): string => {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
+  };
+  const formatDateDDMMYYYY = formatDateDot;
+
   // Title for current header based on viewMode
+  // User requirements:
+  // widok miesiąc - nazwa miesiąca (małymi literami)
+  // widok 4 tygodnie - z DD-MM-RRRR na DD.MM.RRRR
+  // widok 2 tygodnie - z DD-MM-RRRR na DD.MM.RRRR
+  // widok tydzień - z DD-MM-RRRR na DD.MM.RRRR
+  // widok dzień - z DD-MM-RRRR na DD.MM.RRRR
+  // widok harmonogram - z DD-MM-RRRR na DD.MM.RRRR
   const headerTitle = useMemo(() => {
     const year = cursorDate.getFullYear();
     const month = cursorDate.getMonth();
 
     if (viewMode === 'dzien') {
       const dayName = DAY_NAMES_PL[cursorDate.getDay() === 0 ? 6 : cursorDate.getDay() - 1];
-      return `${dayName}, ${cursorDate.getDate()} ${MONTH_NAMES_GENITIVE_PL[month]} ${year}`;
+      return `${dayName}, ${formatDateDot(cursorDate)}`;
     }
 
     if (viewMode === 'tydzien') {
       const start = getStartOfWeek(cursorDate);
       const end = new Date(start);
       end.setDate(end.getDate() + 6);
-      if (start.getMonth() === end.getMonth()) {
-        return `${start.getDate()} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} ${start.getFullYear()}`;
-      }
-      return `${start.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[end.getMonth()]} ${end.getFullYear()}`;
+      return `${formatDateDot(start)} – ${formatDateDot(end)}`;
     }
 
     if (viewMode === '2tygodnie') {
       const start = twoWeeksStartDate;
       const end = new Date(start);
       end.setDate(end.getDate() + 13);
-      if (start.getMonth() === end.getMonth()) {
-        return `${start.getDate()} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} ${start.getFullYear()}`;
-      }
-      return `${start.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[end.getMonth()]} ${end.getFullYear()}`;
+      return `${formatDateDot(start)} – ${formatDateDot(end)}`;
     }
 
     if (viewMode === '4tygodnie') {
       const start = getStartOfWeek(cursorDate);
       const end = new Date(start);
       end.setDate(end.getDate() + 27);
-      return `${start.getDate()} ${MONTH_NAMES_GENITIVE_PL[start.getMonth()]} – ${end.getDate()} ${MONTH_NAMES_GENITIVE_PL[end.getMonth()]} ${end.getFullYear()}`;
+      return `${formatDateDot(start)} – ${formatDateDot(end)}`;
     }
 
-    // Miesiąc & Harmonogram
-    return `${MONTH_NAMES_PL[month]} ${year}`;
-  }, [cursorDate, viewMode]);
+    if (viewMode === 'miesiac') {
+      return `${MONTH_NAMES_PL[month].toLowerCase()} ${year}`;
+    }
+
+    // Harmonogram
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    return `${formatDateDot(firstDay)} – ${formatDateDot(lastDay)}`;
+  }, [cursorDate, viewMode, twoWeeksStartDate]);
+
+  // Mobile compact header title so it never overflows screen width
+  const mobileHeaderTitle = useMemo(() => {
+    const year = cursorDate.getFullYear();
+    const month = cursorDate.getMonth();
+
+    if (viewMode === 'dzien') {
+      return formatDateDot(cursorDate);
+    }
+
+    if (viewMode === 'tydzien') {
+      const start = getStartOfWeek(cursorDate);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 6);
+      return `${formatDateDot(start)} – ${formatDateDot(end)}`;
+    }
+
+    if (viewMode === '2tygodnie') {
+      const start = twoWeeksStartDate;
+      const end = new Date(start);
+      end.setDate(end.getDate() + 13);
+      return `${formatDateDot(start)} – ${formatDateDot(end)}`;
+    }
+
+    if (viewMode === '4tygodnie') {
+      const start = getStartOfWeek(cursorDate);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 27);
+      return `${formatDateDot(start)} – ${formatDateDot(end)}`;
+    }
+
+    if (viewMode === 'miesiac') {
+      return `${MONTH_NAMES_PL[month].toLowerCase()} ${year}`;
+    }
+
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    return `${formatDateDot(firstDay)} – ${formatDateDot(lastDay)}`;
+  }, [cursorDate, viewMode, twoWeeksStartDate]);
 
   // Render Month View Data
   const monthGridDays = useMemo(() => {
@@ -1448,8 +1503,6 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
     return days;
   }, [twoWeeksStartDate]);
 
-  // Two weeks sub-view filter ('all' = all 14 days, 'w1' = 1st week, 'w2' = 2nd week)
-  const [twoWeeksFilter, setTwoWeeksFilter] = useState<'all' | 'w1' | 'w2'>('all');
 
   // Map events to date string for fast lookup spanning multiple days if needed
   const eventsByDate = useMemo(() => {
@@ -2320,9 +2373,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               <button
                 type="button"
                 onClick={handleGoToday}
-                className="py-0.5 px-2 rounded-md text-[11px] font-semibold text-neutral-700 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+                className="py-0.5 px-1.5 rounded-md text-[11px] font-bold text-neutral-700 hover:bg-white hover:text-neutral-900 transition-colors cursor-pointer"
+                title="Przejdź do dzisiaj (D)"
               >
-                Dzisiaj
+                D
               </button>
               <button
                 type="button"
@@ -2340,8 +2394,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               </button>
             </div>
 
-            {/* Skróty szybkiego przełączania widoków: Miesiąc (M), 4 tygodnie (4) i Tydzień (T) */}
-            <div className="flex items-center space-x-1 shrink-0">
+            {/* Skróty szybkiego przełączania widoków: Miesiąc (M), 4 tygodnie (4), 2 tygodnie (2) i Tydzień (T) */}
+            <div className="flex items-center space-x-0.5 shrink-0">
               <button
                 type="button"
                 onClick={() => handleSelectViewMode('miesiac')}
@@ -2394,11 +2448,29 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               >
                 T
               </button>
+              {/* Przycisk 6-20 wyświetlany TYLKO w widoku 2 tygodnie, po prawej stronie od przycisku T, a przed datą */}
+              {viewMode === '2tygodnie' && (
+                <button
+                  type="button"
+                  id="btn-scroll-hours-6-20-mobile"
+                  onClick={handleScrollToDefaultHours}
+                  className="inline-flex items-center space-x-0.5 px-1 py-0.5 rounded-md bg-neutral-100 hover:bg-neutral-200 active:bg-neutral-300 text-neutral-700 border border-neutral-300 text-[9px] xs:text-[10px] font-semibold transition cursor-pointer shrink-0 ml-0.5"
+                  title="Przewiń siatkę do domyślnych godzin 6:00 – 20:00"
+                >
+                  <Clock className="w-2.5 h-2.5 text-blue-600 shrink-0" />
+                  <span>6–20</span>
+                </button>
+              )}
             </div>
           </div>
-          <h2 className="text-xs font-bold text-neutral-900 tracking-tight truncate text-right">
-            {headerTitle}
-          </h2>
+          <div className="flex items-center shrink-0 ml-auto min-w-0 pl-1">
+            <h2
+              className="text-[10px] xs:text-[11px] font-bold text-neutral-900 tracking-tight whitespace-nowrap overflow-hidden text-ellipsis text-right"
+              title={headerTitle}
+            >
+              {mobileHeaderTitle}
+            </h2>
+          </div>
         </div>
 
         {/* Desktop Main Calendar Toolbar */}
@@ -2517,12 +2589,27 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               >
                 T
               </button>
+              {/* Przycisk 6-20 wyświetlany TYLKO w widoku 2 tygodnie, po prawej stronie od przycisku T, a przed datą */}
+              {viewMode === '2tygodnie' && (
+                <button
+                  type="button"
+                  id="btn-scroll-hours-6-20-desktop"
+                  onClick={handleScrollToDefaultHours}
+                  className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-neutral-100 hover:bg-neutral-200 active:bg-neutral-300 text-neutral-700 hover:text-neutral-900 border border-neutral-300 text-xs font-semibold shadow-2xs transition cursor-pointer ml-1"
+                  title="Przewiń siatkę do domyślnych godzin 6:00 – 20:00"
+                >
+                  <Clock className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                  <span>6–20</span>
+                </button>
+              )}
             </div>
 
             {/* Wyświetlany zakres dat */}
-            <h2 className="text-sm sm:text-base font-bold text-neutral-900 tracking-tight whitespace-nowrap">
-              {headerTitle}
-            </h2>
+            <div className="flex items-center space-x-2">
+              <h2 className="text-sm sm:text-base font-bold text-neutral-900 tracking-tight whitespace-nowrap">
+                {headerTitle}
+              </h2>
+            </div>
 
           </div>
 
@@ -2633,7 +2720,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                           {isToday ? 'Dzisiaj' : dayName}
                         </span>
                         <span className="text-xs font-semibold text-neutral-800">
-                          {d.getDate()} {MONTH_NAMES_GENITIVE_PL[d.getMonth()]} {d.getFullYear()}
+                          {formatDateDDMMYYYY(d)}
                         </span>
                         <span className="text-[11px] text-neutral-400">
                           ({dayEvents.length} {dayEvents.length === 1 ? 'pozycja' : 'pozycje'})
@@ -2645,8 +2732,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                           const isGenerated = !!generatedTripMap[event.id];
                           const isTask = isCalendarTaskEvent(event);
                           const isCompleted = isTask && isTaskCompleted(event);
+                          const isPast = isPastEvent(event);
                           const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
-                          const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
+                          const colorDef = getGoogleEventColor(event, isTask, fallbackColor, calendars);
+                          const startStr = formatEventStartTime(event);
 
                           return (
                             <div
@@ -2655,7 +2744,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               style={{
                                 borderLeftColor: colorDef.hex,
                                 borderLeftWidth: '4px',
-                                opacity: isCompleted ? 0.55 : 1,
+                                filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
+                                opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
                               }}
                               className={`p-3 rounded-xl border transition-all hover:shadow-xs cursor-pointer flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
                                 isCompleted
@@ -2668,10 +2758,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               }`}
                             >
                               <div className="flex items-start space-x-3 min-w-0">
-                                <div className="mt-0.5">
+                                <div className="mt-0.5 hidden sm:block">
                                   <span className="inline-flex items-center text-xs font-semibold text-neutral-700 bg-neutral-100 border border-neutral-200 px-2 py-0.5 rounded-md">
                                     <Clock className="w-3 h-3 mr-1 text-neutral-500" />
-                                    {formatEventStartTime(event) || 'Cały dzień'}
+                                    {startStr || 'Cały dzień'}
                                   </span>
                                 </div>
                                 <div className="min-w-0">
@@ -2681,7 +2771,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                       style={{ backgroundColor: colorDef.hex }}
                                     />
                                     <h4 className={`text-sm font-semibold truncate ${isCompleted ? 'line-through text-neutral-400' : 'text-neutral-900'}`}>
-                                      {formatEventStartTime(event) ? `${formatEventStartTime(event)} ` : ''}{event.summary}
+                                      <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>{event.summary}
                                     </h4>
                                     {isTask ? (
                                       isCompleted ? (
@@ -2830,8 +2920,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               const dayEvents = eventsByDate[currentDayKey] || [];
               const isToday = currentDayKey === todayStr;
 
-              const allDayOrLongEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev));
-              const timedEvents = dayEvents.filter((ev) => !isEventLongerThan24hOrAllDay(ev));
+              const allDayOrLongEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev) || isCalendarTaskEvent(ev));
+              const timedEvents = dayEvents.filter((ev) => !isEventLongerThan24hOrAllDay(ev) && !isCalendarTaskEvent(ev));
 
               // Current time marker calculation
               const now = new Date();
@@ -2851,8 +2941,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                         {allDayOrLongEvents.map((event) => {
                           const isTask = isCalendarTaskEvent(event);
                           const isCompleted = isTask && isTaskCompleted(event);
+                          const isPast = isPastEvent(event);
                           const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
-                          const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
+                          const colorDef = getGoogleEventColor(event, isTask, fallbackColor, calendars);
+                          const startStr = formatEventStartTime(event);
 
                           return (
                             <div
@@ -2862,14 +2954,18 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                 backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
                                 color: isCompleted ? '#6b7280' : colorDef.contrastText,
                                 borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.1)',
-                                opacity: isCompleted ? 0.55 : 1,
+                                opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
+                                filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
                               }}
                               className={`text-[10px] sm:text-xs px-2 py-1 rounded-lg font-medium cursor-pointer transition shadow-2xs select-none border flex items-center space-x-1.5 ${
                                 isCompleted ? 'hover:opacity-85 line-through' : 'hover:brightness-95'
                               }`}
                             >
                               <span>{isTask ? (isCompleted ? '✓' : '○') : '●'}</span>
-                              <span className="font-semibold truncate max-w-[200px]">{event.summary}</span>
+                              <span className="font-semibold truncate max-w-[200px]">
+                                <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
+                                {cleanTaskTitle(event.summary)}
+                              </span>
                             </div>
                           );
                         })}
@@ -2945,8 +3041,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                           const ev = item.event;
                           const isTask = isCalendarTaskEvent(ev);
                           const isCompleted = isTask && isTaskCompleted(ev);
+                          const isPast = isPastEvent(ev);
                           const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
-                          const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+                          const colorDef = getGoogleEventColor(ev, isTask, fallbackColor, calendars);
 
                           const startStr = formatEventStartTime(ev);
                           const isVerySmall = item.heightPx <= 28;
@@ -2970,7 +3067,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                 backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
                                 color: isCompleted ? '#6b7280' : colorDef.contrastText,
                                 borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.12)',
-                                opacity: isCompleted ? 0.55 : 1,
+                                opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
+                                filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
                                 zIndex: item.zIndex ?? 10,
                               }}
                               className={`absolute ${
@@ -2995,8 +3093,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                   } font-semibold truncate text-left ${isCompleted ? 'line-through opacity-75' : ''}`}
                                 >
                                   {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
-                                  {startStr ? `${startStr} ` : ''}
-                                  {ev.summary}
+                                  <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
+                                  {cleanTaskTitle(ev.summary)}
                                 </span>
 
                                 {!isVerySmall && (
@@ -3137,7 +3235,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
               <div className="flex-1 grid grid-cols-7 divide-x divide-neutral-200 p-0.5 sm:p-1 min-w-0">
                 {weekDays.map(({ dateStr }) => {
                   const dayEvents = eventsByDate[dateStr] || [];
-                  const allDayEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev));
+                  const allDayEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev) || isCalendarTaskEvent(ev));
 
                   return (
                     <div
@@ -3149,8 +3247,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                       {allDayEvents.map((ev) => {
                         const isTask = isCalendarTaskEvent(ev);
                         const isCompleted = isTask && isTaskCompleted(ev);
+                        const isPast = isPastEvent(ev);
                         const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
-                        const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+                        const colorDef = getGoogleEventColor(ev, isTask, fallbackColor, calendars);
+                        const startStr = formatEventStartTime(ev);
 
                         return (
                           <div
@@ -3160,14 +3260,16 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
                               color: isCompleted ? '#6b7280' : colorDef.contrastText,
                               borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.1)',
-                              opacity: isCompleted ? 0.55 : 1,
+                              opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
+                              filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
                             }}
                             className={`text-[9px] sm:text-[11px] px-1 sm:px-2 py-0.5 rounded-md font-medium truncate cursor-pointer transition shadow-2xs select-none border ${
                               isCompleted ? 'hover:opacity-85 line-through' : 'hover:brightness-95'
                             }`}
-                            title={`${ev.summary} (Cały dzień / >24h)`}
+                            title={`${startStr ? `${startStr} ` : ''}${ev.summary} (Cały dzień / >24h)`}
                           >
                             <span className="mr-0.5 sm:mr-1">{isTask ? (isCompleted ? '✓' : '○') : '●'}</span>
+                            <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
                             {cleanTaskTitle(ev.summary)}
                           </div>
                         );
@@ -3209,7 +3311,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                   const isToday = dateStr === todayStr;
                   const dayEvents = eventsByDate[dateStr] || [];
                   const timedEvents = dayEvents.filter(
-                    (ev) => !isEventLongerThan24hOrAllDay(ev) && !!ev.start.dateTime
+                    (ev) => !isEventLongerThan24hOrAllDay(ev) && !isCalendarTaskEvent(ev) && !!ev.start.dateTime
                   );
 
                   // Current time marker calculation
@@ -3268,8 +3370,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                           const ev = item.event;
                           const isTask = isCalendarTaskEvent(ev);
                           const isCompleted = isTask && isTaskCompleted(ev);
+                          const isPast = isPastEvent(ev);
                           const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
-                          const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+                          const colorDef = getGoogleEventColor(ev, isTask, fallbackColor, calendars);
                           const startStr = formatEventStartTime(ev);
 
                           return (
@@ -3290,7 +3393,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                 backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
                                 color: isCompleted ? '#6b7280' : colorDef.contrastText,
                                 borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.12)',
-                                opacity: isCompleted ? 0.55 : 1,
+                                opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
+                                filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
                                 zIndex: item.zIndex ?? 10,
                               }}
                               className={`absolute rounded-md px-1 sm:px-1.5 py-0.5 text-left shadow-2xs cursor-pointer overflow-hidden transition-all hover:z-40 hover:shadow-md border select-none group min-w-0 flex flex-col items-start justify-start ${
@@ -3301,6 +3405,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               <div className="flex flex-col items-start justify-start text-left leading-tight w-full">
                                 <span className={`font-semibold text-[9px] sm:text-[11px] truncate w-full text-left ${isCompleted ? 'line-through opacity-75' : ''}`}>
                                   {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                                  <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
                                   {cleanTaskTitle(ev.summary)}
                                 </span>
                               </div>
@@ -3424,7 +3529,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                   <div className="flex-1 grid divide-x divide-neutral-200 p-0.5 sm:p-1 w-full min-w-0" style={gridStyle}>
                     {daysToRender.map(({ dateStr }) => {
                       const dayEvents = eventsByDate[dateStr] || [];
-                      const allDayEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev));
+                      const allDayEvents = dayEvents.filter((ev) => isEventLongerThan24hOrAllDay(ev) || isCalendarTaskEvent(ev));
 
                       return (
                         <div
@@ -3436,8 +3541,10 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                           {allDayEvents.map((ev) => {
                             const isTask = isCalendarTaskEvent(ev);
                             const isCompleted = isTask && isTaskCompleted(ev);
+                            const isPast = isPastEvent(ev);
                             const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
-                            const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+                            const colorDef = getGoogleEventColor(ev, isTask, fallbackColor, calendars);
+                            const startStr = formatEventStartTime(ev);
 
                             return (
                               <div
@@ -3447,14 +3554,16 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                   backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
                                   color: isCompleted ? '#6b7280' : colorDef.contrastText,
                                   borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.1)',
-                                  opacity: isCompleted ? 0.55 : 1,
+                                  opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
+                                  filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
                                 }}
                                 className={`text-[7px] sm:text-[9px] px-0.5 sm:px-1 py-0.5 rounded font-medium truncate cursor-pointer transition shadow-2xs select-none border ${
                                   isCompleted ? 'hover:opacity-85 line-through' : 'hover:brightness-95'
                                 }`}
-                                title={`${ev.summary} (Cały dzień)`}
+                                title={`${startStr ? `${startStr} ` : ''}${ev.summary} (Cały dzień)`}
                               >
                                 <span className="mr-0.5">{isTask ? (isCompleted ? '✓' : '○') : '●'}</span>
+                                <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
                                 {cleanTaskTitle(ev.summary)}
                               </div>
                             );
@@ -3500,7 +3609,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                       const isToday = dateStr === todayStr;
                       const dayEvents = eventsByDate[dateStr] || [];
                       const timedEvents = dayEvents.filter(
-                        (ev) => !isEventLongerThan24hOrAllDay(ev) && !!ev.start.dateTime
+                        (ev) => !isEventLongerThan24hOrAllDay(ev) && !isCalendarTaskEvent(ev) && !!ev.start.dateTime
                       );
 
                       const now = new Date();
@@ -3558,8 +3667,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               const ev = item.event;
                               const isTask = isCalendarTaskEvent(ev);
                               const isCompleted = isTask && isTaskCompleted(ev);
+                              const isPast = isPastEvent(ev);
                               const fallbackColor = templateColorMap.get(cleanTaskTitle(ev.summary).toLowerCase());
-                              const colorDef = getGoogleEventColor(ev, isTask, fallbackColor);
+                              const colorDef = getGoogleEventColor(ev, isTask, fallbackColor, calendars);
                               const startStr = formatEventStartTime(ev);
 
                               return (
@@ -3580,7 +3690,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                                     backgroundColor: isCompleted ? '#f3f4f6' : colorDef.hex,
                                     color: isCompleted ? '#6b7280' : colorDef.contrastText,
                                     borderColor: isCompleted ? '#d1d5db' : 'rgba(0,0,0,0.12)',
-                                    opacity: isCompleted ? 0.55 : 1,
+                                    opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
+                                    filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
                                     zIndex: item.zIndex ?? 10,
                                   }}
                                   className={`absolute rounded px-0.5 sm:px-1 py-0.5 text-left shadow-2xs cursor-pointer overflow-hidden transition-all hover:z-40 hover:shadow-md border select-none group min-w-0 flex flex-col items-start justify-start ${
@@ -3616,137 +3727,21 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
 
           return (
             <div className="w-full min-w-0 max-w-full h-full flex-1 flex flex-col bg-white overflow-hidden">
-              {/* Sub-Bar: Week toggle & Scroll to hours 6-20 */}
-              <div className="px-1.5 sm:px-3 py-1 border-b border-neutral-200 bg-neutral-50/90 flex flex-wrap items-center justify-between gap-1 shrink-0 overflow-x-hidden">
-                <div className="flex items-center gap-1 min-w-0">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider hidden sm:inline mr-1">
-                    Widok:
-                  </span>
-                  <div className="inline-flex rounded-lg bg-neutral-200/70 p-0.5 text-xs border border-neutral-300/60 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setTwoWeeksFilter('all')}
-                      className={`px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-semibold transition cursor-pointer ${
-                        twoWeeksFilter === 'all'
-                          ? 'bg-white text-blue-700 shadow-2xs font-bold'
-                          : 'text-neutral-600 hover:text-neutral-900'
-                      }`}
-                    >
-                      <span className="sm:hidden">2 tyg. (pionowo)</span>
-                      <span className="hidden sm:inline">2 tygodnie (pionowo)</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setTwoWeeksFilter('w1')}
-                      className={`px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-semibold transition cursor-pointer ${
-                        twoWeeksFilter === 'w1'
-                          ? 'bg-white text-blue-700 shadow-2xs font-bold'
-                          : 'text-neutral-600 hover:text-neutral-900'
-                      }`}
-                    >
-                      <span className="sm:hidden">Tydz. 1</span>
-                      <span className="hidden sm:inline">1. tydzień ({w1Days[0]?.date.getDate()} – {w1Days[6]?.date.getDate()} {w1Days[0] ? MONTH_NAMES_GENITIVE_PL[w1Days[0].date.getMonth()] : ''})</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setTwoWeeksFilter('w2')}
-                      className={`px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] font-semibold transition cursor-pointer ${
-                        twoWeeksFilter === 'w2'
-                          ? 'bg-white text-blue-700 shadow-2xs font-bold'
-                          : 'text-neutral-600 hover:text-neutral-900'
-                      }`}
-                    >
-                      <span className="sm:hidden">Tydz. 2</span>
-                      <span className="hidden sm:inline">2. tydzień ({w2Days[0]?.date.getDate()} – {w2Days[6]?.date.getDate()} {w2Days[0] ? MONTH_NAMES_GENITIVE_PL[w2Days[0].date.getMonth()] : ''})</span>
-                    </button>
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleScrollToDefaultHours}
-                  className="inline-flex items-center space-x-1 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg bg-white hover:bg-neutral-50 active:bg-neutral-100 text-neutral-700 border border-neutral-250 text-[10px] sm:text-xs font-semibold shadow-2xs transition cursor-pointer ml-auto shrink-0"
-                  title="Przewiń siatkę do domyślnych godzin 6:00 – 20:00"
-                >
-                  <Clock className="w-3 sm:w-3.5 h-3 sm:h-3.5 text-blue-600 shrink-0" />
-                  <span className="hidden sm:inline">Godz. 6 – 20</span>
-                  <span className="sm:hidden">6–20</span>
-                </button>
-              </div>
-
-              {/* Main Content: Vertical 2-week view (Week 1 on top, Week 2 below, one above the other) */}
-              {twoWeeksFilter === 'w1' ? (
-                <div className="flex-1 min-h-0 flex flex-col overflow-hidden w-full">
-                  <div className="px-2 sm:px-3 py-1 bg-blue-50/80 border-b border-blue-200 text-[10px] sm:text-xs font-bold text-blue-900 uppercase tracking-wider flex items-center justify-between shrink-0">
-                    <span>Tydzień 1: {w1Days[0]?.date.getDate()} – {w1Days[6]?.date.getDate()} {w1Days[0] ? MONTH_NAMES_GENITIVE_PL[w1Days[0].date.getMonth()] : ''} {w1Days[0]?.date.getFullYear()}</span>
-                    <span className="text-neutral-400 font-normal lowercase">(godziny 6:00 – 20:00 domyślnie)</span>
-                  </div>
+              {/* Both weeks vertically stacked: Week 1 on top, Week 2 below, separated ONLY by a thin black divider */}
+              <div className="flex-1 min-h-0 flex flex-col overflow-hidden w-full max-w-full">
+                {/* Week 1 Block (Top) - independent vertical scrolling */}
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-white w-full">
                   {renderWeekColumns(w1Days, twoWeeksScrollRef1, true)}
                 </div>
-              ) : twoWeeksFilter === 'w2' ? (
-                <div className="flex-1 min-h-0 flex flex-col overflow-hidden w-full">
-                  <div className="px-2 sm:px-3 py-1 bg-indigo-50/80 border-b border-indigo-200 text-[10px] sm:text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center justify-between shrink-0">
-                    <span>Tydzień 2: {w2Days[0]?.date.getDate()} – {w2Days[6]?.date.getDate()} {w2Days[0] ? MONTH_NAMES_GENITIVE_PL[w2Days[0].date.getMonth()] : ''} {w2Days[0]?.date.getFullYear()}</span>
-                    <span className="text-neutral-400 font-normal lowercase">(godziny 6:00 – 20:00 domyślnie)</span>
-                  </div>
+
+                {/* Thin black divider separating the two weeks */}
+                <div className="w-full h-[1px] bg-black shrink-0" role="separator" />
+
+                {/* Week 2 Block (Bottom) - independent vertical scrolling */}
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-white w-full">
                   {renderWeekColumns(w2Days, twoWeeksScrollRef2, true)}
                 </div>
-              ) : (
-                /* Both weeks vertically stacked: Week 1 on top, Week 2 below ("jeden nad drugim") */
-                <div className="flex-1 min-h-0 flex flex-col divide-y-2 divide-neutral-250 overflow-hidden w-full max-w-full">
-                  {/* Week 1 Block (Top) */}
-                  <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-white w-full">
-                    <div className="px-2 sm:px-3 py-0.5 sm:py-1 bg-blue-50/80 border-b border-blue-200 text-[10px] sm:text-xs font-bold text-blue-900 uppercase tracking-wider flex items-center justify-between shrink-0">
-                      <div className="flex items-center space-x-1.5 truncate">
-                        <span className="bg-blue-600 text-white rounded px-1.5 py-0.5 text-[9px] sm:text-[10px] font-bold">1</span>
-                        <span className="truncate">
-                          Tydzień 1: {w1Days[0]?.date.getDate()} – {w1Days[6]?.date.getDate()} {w1Days[0] ? MONTH_NAMES_GENITIVE_PL[w1Days[0].date.getMonth()] : ''} {w1Days[0]?.date.getFullYear()}
-                        </span>
-                      </div>
-                      <div className="flex items-center space-x-1 shrink-0 ml-1">
-                        <span className="text-neutral-400 font-normal text-[9px] sm:text-[10px] hidden sm:inline lowercase">
-                          (niezależne przewijanie)
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => twoWeeksScrollRef1.current?.scrollTo({ top: 6 * hourHeight, behavior: 'smooth' })}
-                          className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-white hover:bg-blue-100 text-blue-700 border border-blue-200/80 shadow-2xs transition cursor-pointer font-medium"
-                          title="Przewiń Tydzień 1 do 6:00 – 20:00"
-                        >
-                          6:00–20:00
-                        </button>
-                      </div>
-                    </div>
-                    {renderWeekColumns(w1Days, twoWeeksScrollRef1, true)}
-                  </div>
-
-                  {/* Week 2 Block (Bottom) */}
-                  <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-white w-full">
-                    <div className="px-2 sm:px-3 py-0.5 sm:py-1 bg-indigo-50/80 border-b border-indigo-200 text-[10px] sm:text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center justify-between shrink-0">
-                      <div className="flex items-center space-x-1.5 truncate">
-                        <span className="bg-indigo-600 text-white rounded px-1.5 py-0.5 text-[9px] sm:text-[10px] font-bold">2</span>
-                        <span className="truncate">
-                          Tydzień 2: {w2Days[0]?.date.getDate()} – {w2Days[6]?.date.getDate()} {w2Days[0] ? MONTH_NAMES_GENITIVE_PL[w2Days[0].date.getMonth()] : ''} {w2Days[0]?.date.getFullYear()}
-                        </span>
-                      </div>
-                      <div className="flex items-center space-x-1 shrink-0 ml-1">
-                        <span className="text-neutral-400 font-normal text-[9px] sm:text-[10px] hidden sm:inline lowercase">
-                          (niezależne przewijanie)
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => twoWeeksScrollRef2.current?.scrollTo({ top: 6 * hourHeight, behavior: 'smooth' })}
-                          className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 shadow-2xs transition cursor-pointer font-medium"
-                          title="Przewiń Tydzień 2 do 6:00 – 20:00"
-                        >
-                          6:00–20:00
-                        </button>
-                      </div>
-                    </div>
-                    {renderWeekColumns(w2Days, twoWeeksScrollRef2, true)}
-                  </div>
-                </div>
-              )}
+              </div>
             </div>
           );
         })()}
@@ -3856,8 +3851,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                       {dayEvents.map((event) => {
                         const isTask = isCalendarTaskEvent(event);
                         const isCompleted = isTask && isTaskCompleted(event);
+                        const isPast = isPastEvent(event);
                         const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
-                        const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
+                        const colorDef = getGoogleEventColor(event, isTask, fallbackColor, calendars);
                         const startStr = formatEventStartTime(event);
 
                         return (
@@ -3871,7 +3867,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               backgroundColor: isCompleted ? '#f3f4f6' : colorDef.bg,
                               borderColor: isCompleted ? '#e5e7eb' : colorDef.border,
                               color: isCompleted ? '#6b7280' : colorDef.text,
-                              opacity: isCompleted ? 0.55 : 1,
+                              filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
+                              opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
                             }}
                             className={`px-1 sm:px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-medium truncate flex items-center space-x-0.5 sm:space-x-1 border shadow-2xs select-none min-w-0 text-left ${
                               isCompleted ? 'hover:opacity-85' : 'hover:brightness-95'
@@ -3884,6 +3881,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                             />
                             <span className={`truncate text-left ${isCompleted ? 'line-through opacity-75' : ''}`}>
                               {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                              <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
                               {event.summary}
                             </span>
                           </div>
@@ -3989,8 +3987,9 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                       {dayEvents.map((event) => {
                         const isTask = isCalendarTaskEvent(event);
                         const isCompleted = isTask && isTaskCompleted(event);
+                        const isPast = isPastEvent(event);
                         const fallbackColor = templateColorMap.get(cleanTaskTitle(event.summary).toLowerCase());
-                        const colorDef = getGoogleEventColor(event, isTask, fallbackColor);
+                        const colorDef = getGoogleEventColor(event, isTask, fallbackColor, calendars);
                         const startStr = formatEventStartTime(event);
 
                         return (
@@ -4004,7 +4003,8 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                               backgroundColor: isCompleted ? '#f3f4f6' : colorDef.bg,
                               borderColor: isCompleted ? '#e5e7eb' : colorDef.border,
                               color: isCompleted ? '#6b7280' : colorDef.text,
-                              opacity: isCompleted ? 0.55 : 1,
+                              filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
+                              opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
                             }}
                             className={`px-1 sm:px-1.5 py-0.5 rounded text-[8px] sm:text-[11px] font-medium truncate flex items-center space-x-0.5 sm:space-x-1 cursor-pointer border shadow-2xs select-none min-w-0 text-left ${
                               isCompleted ? 'hover:opacity-85' : 'hover:brightness-95'
@@ -4017,6 +4017,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                             />
                             <span className={`truncate text-left ${isCompleted ? 'line-through opacity-75' : ''}`}>
                               {isTask ? (isCompleted ? '✓ ' : '○ ') : ''}
+                              <span className="hidden sm:inline">{startStr ? `${startStr} ` : ''}</span>
                               {event.summary}
                             </span>
                           </div>
@@ -4083,7 +4084,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
       {previewEvent && (() => {
         const isTask = isCalendarTaskEvent(previewEvent);
         const fallbackColor = templateColorMap.get(cleanTaskTitle(previewEvent.summary).toLowerCase());
-        const colorDef = getGoogleEventColor(previewEvent, isTask, fallbackColor);
+        const colorDef = getGoogleEventColor(previewEvent, isTask, fallbackColor, calendars);
 
         return (
           <div
@@ -4141,7 +4142,7 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                             dateStyle: 'full',
                             timeStyle: 'short',
                           })
-                        : `${previewEvent.start.date} (Cały dzień)`}
+                        : `${formatDateDDMMYYYY(new Date(previewEvent.start.date + 'T00:00:00'))} (Cały dzień)`}
                       {previewEvent.end?.dateTime && (
                         <span>
                           {' '}
@@ -4483,55 +4484,68 @@ export const FullCalendarView: React.FC<FullCalendarViewProps> = ({
                   />
                 </div>
 
-                {/* Google Calendar Event Color Picker */}
+                {/* Google Calendar Event Color Picker - Standard + Extended + Custom */}
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
                     <label className="text-xs font-semibold text-neutral-700">
                       Kolor w Kalendarzu Google
                     </label>
-                    <span className="text-[11px] font-medium text-neutral-500">
-                      {GOOGLE_EVENT_COLOR_OPTIONS.find((c) => c.id === eventColorId)?.name || 'Domyślny kolor kalendarza'}
+                    <span className="text-[11px] font-medium text-neutral-500 truncate max-w-[200px]">
+                      {(eventColorId && findColorDefinition(eventColorId)?.name) || 'Domyślny kolor'}
                     </span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
-                    <button
-                      type="button"
-                      onClick={() => setEventColorId('')}
-                      className={`px-2.5 py-1 text-xs rounded-lg border transition-all cursor-pointer ${
-                        !eventColorId
-                          ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
-                          : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
-                      }`}
-                      title="Użyj domyślnego koloru kalendarza"
-                    >
-                      Domyślny
-                    </button>
-                    {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
-                      const isSelected = (eventColorId || '') === col.id;
-                      return (
+                  <div className="p-2.5 rounded-xl bg-neutral-50 border border-neutral-200 space-y-2.5">
+                    {/* Standard Google Calendar colors (1-11) */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider">
+                          Standardowe kolory Google (1-11)
+                        </span>
                         <button
-                          key={col.id}
                           type="button"
-                          onClick={() => setEventColorId(col.id)}
-                          className={`w-7 h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
-                            isSelected
-                              ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
-                              : 'hover:scale-105 opacity-90 hover:opacity-100'
+                          onClick={() => setEventColorId('')}
+                          className={`px-2 py-0.5 text-[11px] rounded-md border transition-all cursor-pointer ${
+                            !eventColorId
+                              ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
+                              : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
                           }`}
-                          style={{ backgroundColor: col.hex }}
-                          title={`${col.name} (Google ID: ${col.id})`}
+                          title="Użyj domyślnego koloru kalendarza"
                         >
-                          {isSelected && (
-                            <span
-                              className="text-xs font-black leading-none"
-                              style={{ color: col.contrastText }}
-                            >
-                              ✓
-                            </span>
-                          )}
+                          Domyślny
                         </button>
-                      );
-                    })}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
+                          const isSelected = (eventColorId || '') === col.id || (eventColorId || '').toLowerCase() === col.hex.toLowerCase();
+                          return (
+                            <button
+                              key={col.id}
+                              type="button"
+                              onClick={() => setEventColorId(col.id || '')}
+                              className={`w-6 h-6 sm:w-7 sm:h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
+                                isSelected
+                                  ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
+                                  : 'hover:scale-105 opacity-90 hover:opacity-100'
+                              }`}
+                              style={{ backgroundColor: col.hex }}
+                              title={`${col.name} (Google ID: ${col.id})`}
+                            >
+                              {isSelected && (
+                                <span
+                                  className="text-[10px] sm:text-xs font-black leading-none"
+                                  style={{ color: col.contrastText }}
+                                >
+                                  ✓
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[11px] text-neutral-500 italic mt-2.5">
+                        Rozszerzona paleta kolorów Google nie jest obsługiwana
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>

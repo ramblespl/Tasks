@@ -36,7 +36,14 @@ import {
   filterCalendarEvents,
   getTodayDateString,
 } from '../utils/dateFilterUtils';
-import { getGoogleEventColor, GOOGLE_EVENT_COLORS, GOOGLE_EVENT_COLOR_OPTIONS, isCalendarTaskEvent } from '../utils/googleCalendarColors';
+import {
+  getGoogleEventColor,
+  findColorDefinition,
+  GOOGLE_EVENT_COLORS,
+  GOOGLE_EVENT_COLOR_OPTIONS,
+  isCalendarTaskEvent,
+  isPastEvent,
+} from '../utils/googleCalendarColors';
 
 const MONTH_NAMES_GENITIVE_PL = [
   'stycznia', 'lutego', 'marca', 'kwietnia', 'maja', 'czerwca',
@@ -1440,7 +1447,7 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
                         {isToday ? 'Dzisiaj' : dayName}
                       </span>
                       <span className="text-xs font-semibold text-neutral-800">
-                        {d.getDate()} {MONTH_NAMES_GENITIVE_PL[d.getMonth()]} {d.getFullYear()}
+                        {String(d.getDate()).padStart(2, '0')}.{String(d.getMonth() + 1).padStart(2, '0')}.{d.getFullYear()}
                       </span>
                       <span className="text-[11px] text-neutral-400">
                         ({dayEvents.length} {dayEvents.length === 1 ? 'pozycja' : 'pozycje'})
@@ -1454,11 +1461,12 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
                         const isCurrentlyGenerating = generatingEventId === event.id;
                         const isTask = isCalendarTaskEvent(event);
                         const isCompleted = isTask && isTaskCompleted(event);
+                        const isPast = isPastEvent(event);
                         const daysUntil = getDaysUntil(rawStart);
                         const templateColorId = templates?.find(
                           (tpl) => cleanTaskTitle(tpl.title).toLowerCase() === cleanTaskTitle(event.summary).toLowerCase()
                         )?.colorId;
-                        const eventColor = getGoogleEventColor(event, isTask, templateColorId);
+                        const eventColor = getGoogleEventColor(event, isTask, templateColorId, calendars);
 
                         return (
                           <div
@@ -1473,7 +1481,8 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
                             style={{
                               borderLeftColor: eventColor.hex,
                               borderLeftWidth: '4px',
-                              opacity: isCompleted ? 0.55 : 1,
+                              filter: isPast ? 'brightness(0.82) saturate(0.85)' : undefined,
+                              opacity: isCompleted ? 0.55 : (isPast ? 0.60 : 1),
                             }}
                           >
                             <div className="flex flex-col gap-2.5 min-w-0">
@@ -2170,15 +2179,19 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
                               <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-neutral-100 text-neutral-600">
                                 {dueInfo.timingLabel}
                               </span>
-                              {tpl.colorId && GOOGLE_EVENT_COLORS[tpl.colorId] && (
-                                <span className="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-neutral-100 text-neutral-800 border border-neutral-200">
-                                  <span
-                                    className="w-1.5 h-1.5 rounded-full inline-block shrink-0"
-                                    style={{ backgroundColor: GOOGLE_EVENT_COLORS[tpl.colorId].hex }}
-                                  />
-                                  <span>{GOOGLE_EVENT_COLORS[tpl.colorId].name}</span>
-                                </span>
-                              )}
+                              {tpl.colorId && (() => {
+                                const tplCol = findColorDefinition(tpl.colorId);
+                                if (!tplCol) return null;
+                                return (
+                                  <span className="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-neutral-100 text-neutral-800 border border-neutral-200">
+                                    <span
+                                      className="w-1.5 h-1.5 rounded-full inline-block shrink-0"
+                                      style={{ backgroundColor: tplCol.hex }}
+                                    />
+                                    <span>{tplCol.name}</span>
+                                  </span>
+                                );
+                              })()}
                             </div>
                             <div className="text-[11px] text-neutral-500 flex items-center gap-2 mt-0.5">
                               <span className="flex items-center">
@@ -2687,55 +2700,68 @@ export const CalendarCard: React.FC<CalendarCardProps> = ({
                     />
                   </div>
 
-                  {/* Google Calendar Event Color Picker */}
+                  {/* Google Calendar Event Color Picker - Standard + Extended + Custom */}
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
                       <label className="text-xs font-semibold text-neutral-700">
                         Kolor w Kalendarzu Google
                       </label>
-                      <span className="text-[11px] font-medium text-neutral-500">
-                        {GOOGLE_EVENT_COLOR_OPTIONS.find((c) => c.id === eventColorId)?.name || 'Domyślny kolor kalendarza'}
+                      <span className="text-[11px] font-medium text-neutral-500 truncate max-w-[200px]">
+                        {(eventColorId && findColorDefinition(eventColorId)?.name) || 'Domyślny kolor'}
                       </span>
                     </div>
-                    <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-neutral-50 border border-neutral-200">
-                      <button
-                        type="button"
-                        onClick={() => setEventColorId('')}
-                        className={`px-2.5 py-1 text-xs rounded-lg border transition-all cursor-pointer ${
-                          !eventColorId
-                            ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
-                            : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
-                        }`}
-                        title="Użyj domyślnego koloru kalendarza"
-                      >
-                        Domyślny
-                      </button>
-                      {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
-                        const isSelected = (eventColorId || '') === col.id;
-                        return (
+                    <div className="p-2.5 rounded-xl bg-neutral-50 border border-neutral-200 space-y-2.5">
+                      {/* Standard Google Calendar colors (1-11) */}
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider">
+                            Standardowe kolory Google (1-11)
+                          </span>
                           <button
-                            key={col.id}
                             type="button"
-                            onClick={() => setEventColorId(col.id)}
-                            className={`w-7 h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
-                              isSelected
-                                ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
-                                : 'hover:scale-105 opacity-90 hover:opacity-100'
+                            onClick={() => setEventColorId('')}
+                            className={`px-2 py-0.5 text-[11px] rounded-md border transition-all cursor-pointer ${
+                              !eventColorId
+                                ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-2xs'
+                                : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-100'
                             }`}
-                            style={{ backgroundColor: col.hex }}
-                            title={`${col.name} (Google ID: ${col.id})`}
+                            title="Użyj domyślnego koloru kalendarza"
                           >
-                            {isSelected && (
-                              <span
-                                className="text-xs font-black leading-none"
-                                style={{ color: col.contrastText }}
-                              >
-                                ✓
-                              </span>
-                            )}
+                            Domyślny
                           </button>
-                        );
-                      })}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {GOOGLE_EVENT_COLOR_OPTIONS.map((col) => {
+                            const isSelected = (eventColorId || '') === col.id || (eventColorId || '').toLowerCase() === col.hex.toLowerCase();
+                            return (
+                              <button
+                                key={col.id}
+                                type="button"
+                                onClick={() => setEventColorId(col.id || '')}
+                                className={`w-6 h-6 sm:w-7 sm:h-7 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-2xs border border-black/10 ${
+                                  isSelected
+                                    ? 'ring-2 ring-blue-600 ring-offset-2 scale-110'
+                                    : 'hover:scale-105 opacity-90 hover:opacity-100'
+                                }`}
+                                style={{ backgroundColor: col.hex }}
+                                title={`${col.name} (Google ID: ${col.id})`}
+                              >
+                                {isSelected && (
+                                  <span
+                                    className="text-[10px] sm:text-xs font-black leading-none"
+                                    style={{ color: col.contrastText }}
+                                  >
+                                    ✓
+                                  </span>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <p className="text-[11px] text-neutral-500 italic mt-2.5">
+                          Rozszerzona paleta kolorów Google nie jest obsługiwana
+                        </p>
+                      </div>
                     </div>
                   </div>
                 </div>

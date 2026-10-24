@@ -1041,6 +1041,35 @@ export default function App() {
     };
   }, [token, autoSync, selectedCalendarIds, addLog]);
 
+  // Synchronizacja przy powrocie do aplikacji (np. po edycji wydarzenia w Google Calendar)
+  const lastFocusSyncRef = useRef<number>(Date.now());
+  useEffect(() => {
+    if (!token) return;
+
+    const handleWindowFocus = () => {
+      const now = Date.now();
+      // Ograniczenie częstotliwości: co najmniej 5 sekund między odświeżeniami
+      if (now - lastFocusSyncRef.current < 5000) return;
+      lastFocusSyncRef.current = now;
+
+      // Ciche odświeżenie wydarzeń w tle, aby natychmiast wychwycić zmiany w Google Calendar
+      fetchEvents(token);
+    };
+
+    window.addEventListener('focus', handleWindowFocus);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        handleWindowFocus();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('focus', handleWindowFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [token, fetchEvents]);
+
   // Manual & Auto Refresh Events - robustly fetches fresh calendars and events
   const handleRefreshEvents = useCallback(async (overrideCalendarIds?: string[]) => {
     const activeToken = token || getStoredAuth()?.token;

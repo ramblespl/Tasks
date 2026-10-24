@@ -1,5 +1,6 @@
 import { CalendarListItem, CalendarEventItem } from '../types';
 import { refreshGoogleTokenSilently, clearStoredAuth } from './firebaseAuth';
+import { resolveSafeGoogleApiColor } from '../utils/googleCalendarColors';
 
 const fetchCalendarWithRetry = async (
   url: string,
@@ -188,7 +189,11 @@ export const getCalendarEvents = async (
     },
     location: item.location,
     htmlLink: item.htmlLink,
-    colorId: item.colorId,
+    colorId:
+      item.colorId ||
+      item.extendedProperties?.private?.customColorId ||
+      item.extendedProperties?.private?.customColorHex ||
+      undefined,
     calendarId: calendarId,
     recurringEventId: item.recurringEventId,
     recurrence: item.recurrence,
@@ -210,6 +215,10 @@ export interface CreateCalendarEventPayload {
   };
   location?: string;
   colorId?: string;
+  extendedProperties?: {
+    private?: Record<string, string>;
+    shared?: Record<string, string>;
+  };
   reminders?: {
     useDefault: boolean;
     overrides?: Array<{ method: 'popup' | 'email'; minutes: number }>;
@@ -353,6 +362,24 @@ export const createCalendarEvent = async (
     throw new Error('Brak tokenu autoryzacji Google. Zaloguj się ponownie.');
   }
 
+  const { apiColorId, customColorId, customColorHex } = resolveSafeGoogleApiColor(payload.colorId);
+
+  const apiPayload: any = {
+    ...payload,
+    colorId: apiColorId || undefined,
+  };
+
+  // If there's an extended color (12-34) or custom hex (#...), persist it in extendedProperties.private
+  if (customColorId && (!apiColorId || customColorId !== apiColorId || customColorId.startsWith('#'))) {
+    apiPayload.extendedProperties = {
+      private: {
+        ...(payload.extendedProperties?.private || {}),
+        customColorId,
+        customColorHex: customColorHex || '',
+      },
+    };
+  }
+
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
 
   const response = await fetchCalendarWithRetry(url, {
@@ -362,7 +389,7 @@ export const createCalendarEvent = async (
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(apiPayload),
   });
 
   if (!response.ok) {
@@ -393,7 +420,12 @@ export const createCalendarEvent = async (
     },
     location: item.location,
     htmlLink: item.htmlLink,
-    colorId: item.colorId,
+    colorId:
+      (payload.colorId !== undefined ? (payload.colorId || undefined) : undefined) ||
+      item.colorId ||
+      item.extendedProperties?.private?.customColorId ||
+      undefined,
+    calendarId,
   };
 };
 
@@ -457,6 +489,8 @@ export const updateCalendarEvent = async (
     ? Object.fromEntries(Object.entries(payload.end).filter(([_, v]) => v !== null && v !== undefined))
     : undefined;
 
+  const { apiColorId, customColorId, customColorHex } = resolveSafeGoogleApiColor(payload.colorId);
+
   const sanitizedPayload: Partial<CreateCalendarEventPayload> = {
     ...payload,
     ...(cleanStart ? { start: cleanStart as any } : {}),
@@ -481,7 +515,22 @@ export const updateCalendarEvent = async (
       if (sanitizedPayload.summary !== undefined) existingItem.summary = sanitizedPayload.summary;
       if (sanitizedPayload.location !== undefined) existingItem.location = sanitizedPayload.location;
       if (sanitizedPayload.description !== undefined) existingItem.description = sanitizedPayload.description;
-      if (sanitizedPayload.colorId !== undefined) existingItem.colorId = sanitizedPayload.colorId;
+      if (sanitizedPayload.colorId !== undefined) {
+        existingItem.colorId = apiColorId || null;
+        if (customColorId && (!apiColorId || customColorId !== apiColorId || customColorId.startsWith('#'))) {
+          existingItem.extendedProperties = {
+            ...(existingItem.extendedProperties || {}),
+            private: {
+              ...(existingItem.extendedProperties?.private || {}),
+              customColorId,
+              customColorHex: customColorHex || '',
+            },
+          };
+        } else if (existingItem.extendedProperties?.private) {
+          delete existingItem.extendedProperties.private.customColorId;
+          delete existingItem.extendedProperties.private.customColorHex;
+        }
+      }
 
       if (cleanStart) {
         existingItem.start = cleanStart;
@@ -516,7 +565,11 @@ export const updateCalendarEvent = async (
           },
           location: item.location,
           htmlLink: item.htmlLink,
-          colorId: item.colorId,
+          colorId:
+            (payload.colorId !== undefined ? (payload.colorId || undefined) : undefined) ||
+            item.colorId ||
+            undefined,
+          calendarId,
         };
       }
     }
@@ -525,6 +578,21 @@ export const updateCalendarEvent = async (
   }
 
   // Fallback to PATCH if GET/PUT was not successful
+  const patchBody: any = {
+    ...sanitizedPayload,
+  };
+  if (sanitizedPayload.colorId !== undefined) {
+    patchBody.colorId = apiColorId || null;
+    if (customColorId && (!apiColorId || customColorId !== apiColorId || customColorId.startsWith('#'))) {
+      patchBody.extendedProperties = {
+        private: {
+          customColorId,
+          customColorHex: customColorHex || '',
+        },
+      };
+    }
+  }
+
   const response = await fetchCalendarWithRetry(url, {
     method: 'PATCH',
     headers: {
@@ -532,7 +600,7 @@ export const updateCalendarEvent = async (
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    body: JSON.stringify(sanitizedPayload),
+    body: JSON.stringify(patchBody),
   });
 
   if (!response.ok) {
@@ -563,7 +631,11 @@ export const updateCalendarEvent = async (
     },
     location: item.location,
     htmlLink: item.htmlLink,
-    colorId: item.colorId,
+    colorId:
+      (payload.colorId !== undefined ? (payload.colorId || undefined) : undefined) ||
+      item.colorId ||
+      undefined,
+    calendarId,
   };
 };
 

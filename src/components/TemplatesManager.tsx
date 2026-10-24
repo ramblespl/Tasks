@@ -30,7 +30,7 @@ import {
 } from 'lucide-react';
 import { TaskTemplateItem, TaskCategory, DateAnchor, TaskTemplateSet, GoogleTaskList, TemplateCreationMode, CalendarListItem } from '../types';
 import { ALL_CALENDARS_ID, findPrimaryCalendar } from '../services/googleCalendarApi';
-import { GOOGLE_EVENT_COLORS, GOOGLE_EVENT_COLOR_OPTIONS } from '../utils/googleCalendarColors';
+import { GOOGLE_EVENT_COLORS, GOOGLE_EVENT_COLOR_OPTIONS, findColorDefinition } from '../utils/googleCalendarColors';
 import {
   formatOffsetLabel,
   getCategoryBadge,
@@ -1114,15 +1114,19 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
                         )}
 
                         {/* Color badge if custom color chosen */}
-                        {item.colorId && GOOGLE_EVENT_COLORS[item.colorId] && (
-                          <span className="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-neutral-100 text-neutral-800 border border-neutral-200">
-                            <span
-                              className="w-2 h-2 rounded-full inline-block shrink-0"
-                              style={{ backgroundColor: GOOGLE_EVENT_COLORS[item.colorId].hex }}
-                            />
-                            <span>{GOOGLE_EVENT_COLORS[item.colorId].name}</span>
-                          </span>
-                        )}
+                        {item.colorId && (() => {
+                          const col = findColorDefinition(item.colorId);
+                          if (!col) return null;
+                          return (
+                            <span className="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-neutral-100 text-neutral-800 border border-neutral-200">
+                              <span
+                                className="w-2 h-2 rounded-full inline-block shrink-0"
+                                style={{ backgroundColor: col.hex }}
+                              />
+                              <span>{col.name}</span>
+                            </span>
+                          );
+                        })()}
 
                         {/* Target Calendar badge if set */}
                         {item.targetCalendarId && (
@@ -1613,15 +1617,19 @@ export const TemplatesManager: React.FC<TemplatesManagerProps> = ({
                   <label className="text-xs font-semibold text-neutral-700">
                     Kolor wydarzenia w Kalendarzu Google
                   </label>
-                  {formColorId && GOOGLE_EVENT_COLORS[formColorId] && (
-                    <span className="text-xs font-bold text-neutral-800 flex items-center space-x-1.5">
-                      <span
-                        className="w-2.5 h-2.5 rounded-full inline-block"
-                        style={{ backgroundColor: GOOGLE_EVENT_COLORS[formColorId].hex }}
-                      />
-                      <span>{GOOGLE_EVENT_COLORS[formColorId].name}</span>
-                    </span>
-                  )}
+                  {formColorId && (() => {
+                    const col = findColorDefinition(formColorId);
+                    if (!col) return null;
+                    return (
+                      <span className="text-xs font-bold text-neutral-800 flex items-center space-x-1.5">
+                        <span
+                          className="w-2.5 h-2.5 rounded-full inline-block"
+                          style={{ backgroundColor: col.hex }}
+                        />
+                        <span>{col.name}</span>
+                      </span>
+                    );
+                  })()}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 p-2.5 bg-neutral-50 rounded-xl border border-neutral-200">
